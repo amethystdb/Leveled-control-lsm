@@ -5,6 +5,9 @@ import (
 	"time"
 )
 
+// Standardized with adaptive controller to ensure fair comparison
+const MinSegmentSize = int64(4 * 1024)
+
 type StaticLeveledController struct{}
 
 func NewLeveledController() *StaticLeveledController {
@@ -17,6 +20,11 @@ func (c *StaticLeveledController) ShouldRewrite(meta *common.SegmentMeta) (bool,
 
 	//cooldown check to prevent thrashing
 	if !meta.CooldownExpired(now, 1) {
+		return false, common.LEVELED, ""
+	}
+
+	// size gate: don't compact tiny files (standardized for benchmarks)
+	if meta.Size() < MinSegmentSize {
 		return false, common.LEVELED, ""
 	}
 

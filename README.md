@@ -1,6 +1,6 @@
-# Amethyst LSM-Tree (Control/Baseline)
+# Amethyst LSM-Tree (Leveled Compaction)
 
-A baseline implementation of an LSM-Tree storage engine in Go. This serves as the control for benchmarking against adaptive compaction strategies.
+A clean implementation of an LSM-Tree storage engine with leveled compaction in Go. This version uses pure leveled compaction strategy throughout.
 
 ## Features
 
@@ -8,15 +8,14 @@ A baseline implementation of an LSM-Tree storage engine in Go. This serves as th
 - **Memtable**: In-memory sorted buffer
 - **SSTable**: Sorted String Table persistence
 - **Sparse Index**: Efficient key lookup
-- **Leveled Compaction**: Default base LSM strategy
-- **Benchmark Controllers**: Static tiered and leveled strategies for comparison
+- **Leveled Compaction**: Read-optimized compaction strategy
 
 ## Architecture
 
 ```
-Write Path: Put() → WAL → Memtable → Flush → SSTable (TIERED)
+Write Path: Put() → WAL → Memtable → Flush → SSTable (LEVELED)
 Read Path:  Get() → Memtable → SSTable (with sparse index)
-Compaction: Background merge (TIERED → LEVELED)
+Compaction: Background merge (LEVELED strategy)
 ```
 
 ## Usage
@@ -27,7 +26,7 @@ cd amethyst
 go run ./cmd/amethystd
 ```
 
-### Compare compaction strategies:
+### Test leveled compaction strategy:
 ```bash
 cd amethyst
 go run test_strategies.go
@@ -57,23 +56,17 @@ amethyst/
 └── test_strategies.go     # Strategy comparison tool
 ```
 
-## Compaction Strategies
+## Compaction Strategy
 
-**Base LSM (Built-in Leveled)**:
-- Triggers on read count > 10 or overlap
-- Always compacts to LEVELED strategy
+**Leveled Compaction**:
+- Triggers on read count > 10 or overlap detection
+- Optimized for read-heavy workloads
+- Reduces fragmentation through background merging
+- All segments use LEVELED strategy
 
-**Static Tiered** (benchmark):
-- Triggers on write count > 50
-- Stays TIERED after compaction
+## Extending the System
 
-**Static Leveled** (benchmark):
-- Triggers on read count > 10 or overlap
-- Compacts to LEVELED strategy
-
-## Extending for Benchmarking
-
-To add new compaction strategies, implement the `Controller` interface:
+To customize the compaction strategy, implement the `Controller` interface:
 
 ```go
 type Controller interface {

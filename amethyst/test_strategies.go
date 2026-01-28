@@ -55,33 +55,22 @@ func runStrategy(strategyName string, ctrl compaction.Controller) {
 	// Flush to disk
 	log.Println("Flushing to disk...")
 	data := mem.Flush()
-	seg1, _ := sstWriter.WriteSegment(data, common.TIERED)
+	seg1, _ := sstWriter.WriteSegment(data, common.LEVELED)
 	meta.RegisterSegment(seg1)
 	w.Truncate()
 	log.Printf("  Segment created: %s (Strategy: %v)", seg1.ID[:8], seg1.Strategy)
 
-	// Simulate workload based on strategy
+	// Simulate workload - Leveled triggers on high read count or overlap
 	currentSeg := meta.GetAllSegments()[0]
 
-	if strategyName == "Static Tiered" {
-		// Tiered triggers on high write count
-		log.Println("\nSimulating write-heavy workload...")
-		for i := 0; i < 60; i++ {
-			meta.UpdateStats(currentSeg.ID, 0, 1)
-		}
-		currentSeg = meta.GetAllSegments()[0]
-		log.Printf("  Write Count: %d", currentSeg.WriteCount)
-	} else {
-		// Leveled triggers on high read count or overlap
-		log.Println("\nSimulating read-heavy workload...")
-		for i := 0; i < 15; i++ {
-			key := fmt.Sprintf("key-%06d", i%500)
-			sstReader.Get(currentSeg, key)
-			meta.UpdateStats(currentSeg.ID, 1, 0)
-		}
-		currentSeg = meta.GetAllSegments()[0]
-		log.Printf("  Read Count: %d", currentSeg.ReadCount)
+	log.Println("\nSimulating read-heavy workload...")
+	for i := 0; i < 15; i++ {
+		key := fmt.Sprintf("key-%06d", i%500)
+		sstReader.Get(currentSeg, key)
+		meta.UpdateStats(currentSeg.ID, 1, 0)
 	}
+	currentSeg = meta.GetAllSegments()[0]
+	log.Printf("  Read Count: %d", currentSeg.ReadCount)
 
 	// Wait for cooldown
 	time.Sleep(2 * time.Second)
@@ -126,15 +115,10 @@ func runStrategy(strategyName string, ctrl compaction.Controller) {
 }
 
 func main() {
-	log.Println("Testing Different Compaction Strategies")
+	log.Println("Testing Leveled Compaction Strategy")
 
-	// Test Static Tiered
-	runStrategy("Static Tiered", benchmarks.NewTieredController())
-
-	log.Println("\n═════════════════════════════════════════════")
-
-	// Test Static Leveled (same as base LSM)
+	// Test Static Leveled
 	runStrategy("Static Leveled", benchmarks.NewLeveledController())
 
-	log.Println("\n✓ All strategy tests complete!")
+	log.Println("\n✓ Leveled strategy test complete!")
 }

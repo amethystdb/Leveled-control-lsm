@@ -26,7 +26,7 @@ func TestBaseLSMCompaction(t *testing.T) {
 	// Create dummy segment with high read count to trigger compaction
 	dummyMeta := &common.SegmentMeta{
 		ID:         "base-seg-1",
-		Strategy:   common.TIERED,
+		Strategy:   common.LEVELED,
 		Length:     5000, // Above MinSegmentSize (4KB)
 		ReadCount:  15,   // Above ReadCountThreshold (10)
 		WriteCount: 0,

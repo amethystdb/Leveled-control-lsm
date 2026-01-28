@@ -91,9 +91,6 @@ func (m *MetricsCollector) Close() {
 }
 
 func strategyToString(s common.CompactionType) string {
-	if s == common.TIERED {
-		return "TIERED"
-	}
 	return "LEVELED"
 }
 
@@ -183,7 +180,7 @@ func main() {
 
 	flushStart := time.Now()
 	data := mem.Flush()
-	seg1, err := sstWriter.WriteSegment(data, common.TIERED)
+	seg1, err := sstWriter.WriteSegment(data, common.LEVELED)
 	if err != nil {
 		panic(err)
 	}

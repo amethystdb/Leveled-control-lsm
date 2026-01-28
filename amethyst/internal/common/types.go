@@ -3,8 +3,7 @@ package common
 type CompactionType int
 
 const (
-	TIERED CompactionType = iota
-	LEVELED
+	LEVELED CompactionType = iota
 )
 
 type SegmentMeta struct {
