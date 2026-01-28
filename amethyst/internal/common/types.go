@@ -3,7 +3,9 @@ package common
 type CompactionType int
 
 const (
-	LEVELED CompactionType = iota
+	// Keep these identical across all repos for standard results
+	TIERED  CompactionType = iota // 0
+	LEVELED                       // 1
 )
 
 type SegmentMeta struct {
@@ -35,8 +37,6 @@ func (s *SegmentMeta) Size() int64 {
 }
 
 // ReadWriteRatio returns reads / writes, guarding against divide-by-zero.
-// If WriteCount == 0, treat ratio as ReadCount.
-// This is a metric used by compaction strategies to make decisions
 func (s *SegmentMeta) ReadWriteRatio() float64 {
 	if s.WriteCount == 0 {
 		return float64(s.ReadCount)

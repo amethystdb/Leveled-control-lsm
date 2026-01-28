@@ -25,9 +25,22 @@ func NewTracker() Tracker {
 }
 
 func (t *tracker) RegisterSegment(meta *common.SegmentMeta) {
+	// 1. Calculate overlap count before registering
+	var overlaps int64
+	for _, other := range t.ordered {
+		if other.Obsolete {
+			continue
+		}
+		// Range overlap check: Not (A is entirely before B OR A is entirely after B)
+		if !(meta.MaxKey < other.MinKey || meta.MinKey > other.MaxKey) {
+			overlaps++
+		}
+	}
+	meta.OverlapCount = overlaps
+
+	// 2. Register the segment
 	t.segments[meta.ID] = meta
 	// prepend so newest segments come first
-	//compute overlapcount function to be added here a bit later.
 	t.ordered = append([]*common.SegmentMeta{meta}, t.ordered...)
 }
 
