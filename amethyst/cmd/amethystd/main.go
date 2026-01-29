@@ -10,112 +10,90 @@ import (
 	"amethyst/internal/sstable/reader"
 	"amethyst/internal/sstable/writer"
 	"amethyst/internal/wal"
-	"encoding/csv"
+	"encoding/json"
+	"flag"
 	"fmt"
-	"log"
+	"math"
+	"math/rand"
 	"os"
 	"time"
 )
 
-// warning to anyone tryna go thru this repo: everything except this fiel has been written mostly by Nilin at normal hours, or Shift at ungodly hours powered by nothing but pure adrenaline and water
-// this file has been refactored by ai. i am not responsible if anything breaks. Thank you for understanding. - Shift.
-// MetricsCollector tracks system events for analysis
-type MetricsCollector struct {
-	events []MetricEvent
-	file   *os.File
-	writer *csv.Writer
+var (
+	workloadFlag  = flag.String("workload", "shift", "Workload type")
+	numKeysFlag   = flag.Int("keys", 10000000, "Number of keys")
+	valueSizeFlag = flag.Int("value-size", 256, "Value size in bytes")
+	engineFlag    = flag.String("engine", "leveled", "Engine name for output")
+)
+
+// Results structure for JSON output
+type Results struct {
+	Engine             string  `json:"engine"`
+	Workload           string  `json:"workload"`
+	NumKeys            int     `json:"num_keys"`
+	ValueSize          int     `json:"value_size"`
+	WriteAmplification float64 `json:"write_amplification"`
+	ReadAmplification  float64 `json:"read_amplification"`
+	SpaceAmplification float64 `json:"space_amplification"`
+	CompactionCount    int     `json:"compaction_count"`
+	TotalDurationSec   float64 `json:"total_duration_sec"`
+
+	// Debug info
+	LogicalBytes   int64 `json:"logical_bytes"`
+	PhysicalBytes  int64 `json:"physical_bytes"`
+	TotalReads     int64 `json:"total_reads"`
+	SegmentScans   int64 `json:"segment_scans"`
+	LiveDataBytes  int64 `json:"live_data_bytes"`
+	TotalDiskBytes int64 `json:"total_disk_bytes"`
+
+	// Phase breakdown (for shift workload)
+	Phases []PhaseResult `json:"phases,omitempty"`
 }
 
-type MetricEvent struct {
-	Timestamp   time.Time
-	EventType   string // "write", "read", "flush", "compaction"
-	SegmentID   string
-	Strategy    string
-	ReadCount   int64
-	WriteCount  int64
-	SegmentSize int64
-	Details     string
+type PhaseResult struct {
+	Name     string  `json:"name"`
+	Duration float64 `json:"duration_sec"`
+	WA       float64 `json:"wa"`
+	RA       float64 `json:"ra"`
 }
 
-func NewMetricsCollector(filename string) (*MetricsCollector, error) {
-	file, err := os.Create(filename)
-	if err != nil {
-		return nil, err
+// Zipfian distribution generator
+func zipfian(n int, s float64) int {
+	sum := 0.0
+	for i := 1; i <= n; i++ {
+		sum += 1.0 / math.Pow(float64(i), s)
 	}
 
-	writer := csv.NewWriter(file)
+	r := rand.Float64() * sum
+	partialSum := 0.0
 
-	// Write CSV header
-	header := []string{
-		"timestamp",
-		"event_type",
-		"segment_id",
-		"strategy",
-		"read_count",
-		"write_count",
-		"segment_size_bytes",
-		"details",
+	for i := 1; i <= n; i++ {
+		partialSum += 1.0 / math.Pow(float64(i), s)
+		if partialSum >= r {
+			return i - 1
+		}
 	}
-	writer.Write(header)
-	writer.Flush()
-
-	return &MetricsCollector{
-		events: make([]MetricEvent, 0),
-		file:   file,
-		writer: writer,
-	}, nil
-}
-
-func (m *MetricsCollector) Record(event MetricEvent) {
-	event.Timestamp = time.Now()
-	m.events = append(m.events, event)
-
-	// Write to CSV immediately
-	record := []string{
-		event.Timestamp.Format(time.RFC3339),
-		event.EventType,
-		event.SegmentID,
-		event.Strategy,
-		fmt.Sprintf("%d", event.ReadCount),
-		fmt.Sprintf("%d", event.WriteCount),
-		fmt.Sprintf("%d", event.SegmentSize),
-		event.Details,
-	}
-	m.writer.Write(record)
-	m.writer.Flush()
-}
-
-func (m *MetricsCollector) Close() {
-	m.writer.Flush()
-	m.file.Close()
-}
-
-func strategyToString(s common.CompactionType) string {
-	return "LEVELED"
+	return n - 1
 }
 
 func main() {
-	// ═══════════════════════════════════════
-	// Setup: Clean Environment
-	// ═══════════════════════════════════════
+	flag.Parse()
+	rand.Seed(time.Now().UnixNano())
+
+	// Clean slate
 	os.Remove("wal.log")
 	os.Remove("sstable.data")
 
-	log.Println("╔════════════════════════════════════════╗")
-	log.Println("║   Amethyst LSM-Tree Evidence Suite    ║")
-	log.Println("╚════════════════════════════════════════╝")
-	log.Println()
+	fmt.Printf("╔════════════════════════════════════════╗\n")
+	fmt.Printf("║  AMETHYST BENCHMARK                    ║\n")
+	fmt.Printf("╚════════════════════════════════════════╝\n")
+	fmt.Printf("Engine:   %s\n", *engineFlag)
+	fmt.Printf("Workload: %s\n", *workloadFlag)
+	fmt.Printf("Keys:     %d\n", *numKeysFlag)
+	fmt.Printf("Value:    %d bytes\n", *valueSizeFlag)
+	fmt.Println()
 
-	// Initialize metrics collector
-	metrics, err := NewMetricsCollector("metrics.csv")
-	if err != nil {
-		panic(err)
-	}
-	defer metrics.Close()
-
-	// ═══════════════════════════════════════
-	// Initialize Components
-	// ═══════════════════════════════════════
+	// Initialize components
 	w, err := wal.NewDiskWAL("wal.log")
 	if err != nil {
 		panic(err)
@@ -136,273 +114,800 @@ func main() {
 	director := compaction.NewDefaultDirector(meta)
 	executor := compaction.NewExecutor(meta, sstReader, sstWriter)
 
-	log.Println("✓ All components initialized")
-	log.Println()
+	// Metrics tracking
+	var logicalBytes int64 = 0
+	var physicalBytes int64 = 0
+	var totalReads int64 = 0
+	var totalSegmentScans int64 = 0
+	compactionCount := 0
+	var phases []PhaseResult
 
-	// ═══════════════════════════════════════
-	// TEST 1: Initial Write Workload
-	// ═══════════════════════════════════════
-	log.Println("┌─────────────────────────────────────────┐")
-	log.Println("│  TEST 1: Initial Write Workload         │")
-	log.Println("└─────────────────────────────────────────┘")
+	startTime := time.Now()
 
-	const numKeys = 500
-	log.Printf("Writing %d keys to memtable...", numKeys)
+	// Run workload
+	switch *workloadFlag {
+	case "shift":
+		phases = runShift(w, mem, meta, sstWriter, sstReader, director, executor,
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
+			&totalReads, &totalSegmentScans, &compactionCount)
 
-	writeStart := time.Now()
-	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprintf("key-%06d", i)
-		val := []byte(fmt.Sprintf("value-%06d", i))
+	case "pure-write":
+		runPureWrite(w, mem, meta, sstWriter, director, executor,
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes, &compactionCount)
 
-		if err := w.LogPut(key, val); err != nil {
-			panic(err)
-		}
-		mem.Put(key, val)
+	case "pure-read":
+		runPureRead(w, mem, meta, sstWriter, sstReader,
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
+			&totalReads, &totalSegmentScans)
+
+	case "mixed":
+		runMixed(w, mem, meta, sstWriter, sstReader, director, executor,
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
+			&totalReads, &totalSegmentScans, &compactionCount)
+
+	case "read-heavy":
+		runReadHeavy(w, mem, meta, sstWriter, sstReader, director, executor,
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
+			&totalReads, &totalSegmentScans, &compactionCount)
+
+	case "write-heavy":
+		runWriteHeavy(w, mem, meta, sstWriter, sstReader, director, executor,
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
+			&totalReads, &totalSegmentScans, &compactionCount)
+
+	case "zipfian":
+		runZipfian(w, mem, meta, sstWriter, sstReader, director, executor,
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
+			&totalReads, &totalSegmentScans, &compactionCount)
+
+	default:
+		fmt.Printf("Unknown workload: %s\n", *workloadFlag)
+		os.Exit(1)
 	}
-	writeDuration := time.Since(writeStart)
 
-	log.Printf("  ✓ Wrote %d keys in %v (%.0f ops/sec)",
-		numKeys, writeDuration, float64(numKeys)/writeDuration.Seconds())
+	totalDuration := time.Since(startTime)
 
-	// Record write metrics
-	metrics.Record(MetricEvent{
-		EventType: "write_batch",
-		Details:   fmt.Sprintf("wrote %d keys in %v", numKeys, writeDuration),
-	})
+	// Calculate final metrics
+	wa := float64(physicalBytes) / float64(logicalBytes)
+	ra := 0.0
+	if totalReads > 0 {
+		ra = float64(totalSegmentScans) / float64(totalReads)
+	}
 
-	// ═══════════════════════════════════════
-	// TEST 2: Flush to Disk
-	// ═══════════════════════════════════════
-	log.Println()
-	log.Println("┌─────────────────────────────────────────┐")
-	log.Println("│  TEST 2: Flush to Disk                  │")
-	log.Println("└─────────────────────────────────────────┘")
+	// Space amplification (approximate)
+	allSegs := meta.GetAllSegments()
+	liveDataBytes := int64(*numKeysFlag * (*valueSizeFlag + 20)) // rough estimate
+	totalDiskBytes := int64(0)
+	for _, seg := range allSegs {
+		totalDiskBytes += seg.Length
+	}
+	sa := float64(totalDiskBytes) / float64(liveDataBytes)
 
-	flushStart := time.Now()
-	data := mem.Flush()
-	seg1, err := sstWriter.WriteSegment(data, common.LEVELED)
+	// Create results
+	results := Results{
+		Engine:             *engineFlag,
+		Workload:           *workloadFlag,
+		NumKeys:            *numKeysFlag,
+		ValueSize:          *valueSizeFlag,
+		WriteAmplification: wa,
+		ReadAmplification:  ra,
+		SpaceAmplification: sa,
+		CompactionCount:    compactionCount,
+		TotalDurationSec:   totalDuration.Seconds(),
+		LogicalBytes:       logicalBytes,
+		PhysicalBytes:      physicalBytes,
+		TotalReads:         totalReads,
+		SegmentScans:       totalSegmentScans,
+		LiveDataBytes:      liveDataBytes,
+		TotalDiskBytes:     totalDiskBytes,
+		Phases:             phases,
+	}
+
+	// Print summary
+	fmt.Printf("\n")
+	fmt.Printf("╔════════════════════════════════════════╗\n")
+	fmt.Printf("║  RESULTS                               ║\n")
+	fmt.Printf("╚════════════════════════════════════════╝\n")
+	fmt.Printf("Write Amplification:  %.2f\n", wa)
+	fmt.Printf("Read Amplification:   %.2f\n", ra)
+	fmt.Printf("Space Amplification:  %.2f\n", sa)
+	fmt.Printf("Compaction Count:     %d\n", compactionCount)
+	fmt.Printf("Total Duration:       %.2fs\n", totalDuration.Seconds())
+	fmt.Printf("Throughput:           %.0f ops/sec\n",
+		float64(*numKeysFlag)/totalDuration.Seconds())
+	fmt.Println()
+
+	// Save to JSON
+	data, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		panic(err)
 	}
-	meta.RegisterSegment(seg1)
-	w.Truncate()
-	flushDuration := time.Since(flushStart)
 
-	log.Printf("  Segment ID:     %s", seg1.ID[:8]+"...")
-	log.Printf("  Strategy:       %s", strategyToString(seg1.Strategy))
-	log.Printf("  Size:           %d bytes", seg1.Length)
-	log.Printf("  Key Range:      [%s → %s]", seg1.MinKey, seg1.MaxKey)
-	log.Printf("  Flush Duration: %v", flushDuration)
-
-	// Record flush metrics
-	metrics.Record(MetricEvent{
-		EventType:   "flush",
-		SegmentID:   seg1.ID[:8],
-		Strategy:    strategyToString(seg1.Strategy),
-		SegmentSize: seg1.Length,
-		Details:     fmt.Sprintf("flushed in %v", flushDuration),
-	})
-
-	// ═══════════════════════════════════════
-	// TEST 3: Read Verification
-	// ═══════════════════════════════════════
-	log.Println()
-	log.Println("┌─────────────────────────────────────────┐")
-	log.Println("│  TEST 3: Read Verification              │")
-	log.Println("└─────────────────────────────────────────┘")
-
-	allSegs := meta.GetAllSegments()
-	if len(allSegs) != 1 {
-		panic(fmt.Sprintf("Expected 1 segment, got %d", len(allSegs)))
+	filename := fmt.Sprintf("results_%s_%s.json", *engineFlag, *workloadFlag)
+	err = os.WriteFile(filename, data, 0644)
+	if err != nil {
+		panic(err)
 	}
 
-	verifyStart := time.Now()
-	failCount := 0
+	fmt.Printf("Results saved to: %s\n", filename)
+}
+
+// ========================================
+// WORKLOAD IMPLEMENTATIONS
+// ========================================
+
+func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
+	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
+	director compaction.Director, executor compaction.Executor,
+	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
+	compactionCount *int) []PhaseResult {
+
+	var phases []PhaseResult
+
+	// PHASE 1: Write
+	fmt.Println("=== PHASE 1: Write ===")
+	phase1Start := time.Now()
+
 	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprintf("key-%06d", i)
-		expectedVal := fmt.Sprintf("value-%06d", i)
+		key := fmt.Sprintf("key-%010d", i)
+		val := make([]byte, valueSize)
+		rand.Read(val)
 
-		val, ok := sstReader.Get(allSegs[0], key)
-		if !ok || string(val) != expectedVal {
-			failCount++
-		}
-	}
-	verifyDuration := time.Since(verifyStart)
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
 
-	if failCount > 0 {
-		panic(fmt.Sprintf("Read verification failed: %d errors", failCount))
-	}
-
-	log.Printf("  ✓ Verified %d keys in %v (%.0f ops/sec)",
-		numKeys, verifyDuration, float64(numKeys)/verifyDuration.Seconds())
-
-	// ═══════════════════════════════════════
-	// TEST 4: Read-Heavy Workload
-	// ═══════════════════════════════════════
-	log.Println()
-	log.Println("┌─────────────────────────────────────────┐")
-	log.Println("│  TEST 4: Read-Heavy Workload            │")
-	log.Println("└─────────────────────────────────────────┘")
-
-	const numReads = 20_000
-	log.Printf("Executing %d reads...", numReads)
-
-	currentSeg := allSegs[0]
-	readStart := time.Now()
-
-	for i := 0; i < numReads; i++ {
-		key := fmt.Sprintf("key-%06d", i%numKeys)
-		sstReader.Get(currentSeg, key)
-		meta.UpdateStats(currentSeg.ID, 1, 0)
-	}
-
-	readDuration := time.Since(readStart)
-	currentSeg = meta.GetAllSegments()[0]
-
-	log.Printf("  Reads Completed: %d", currentSeg.ReadCount)
-	log.Printf("  Read Duration:   %v (%.0f ops/sec)",
-		readDuration, float64(numReads)/readDuration.Seconds())
-	log.Printf("  R/W Ratio:       %.2f", currentSeg.ReadWriteRatio())
-
-	// Record read workload metrics
-	metrics.Record(MetricEvent{
-		EventType:   "read_workload",
-		SegmentID:   currentSeg.ID[:8],
-		Strategy:    strategyToString(currentSeg.Strategy),
-		ReadCount:   currentSeg.ReadCount,
-		WriteCount:  currentSeg.WriteCount,
-		SegmentSize: currentSeg.Length,
-		Details:     fmt.Sprintf("%d reads in %v, ratio=%.2f", numReads, readDuration, currentSeg.ReadWriteRatio()),
-	})
-
-	// Wait for cooldown
-	log.Println()
-	log.Println("  ⏳ Waiting for cooldown period (2s)...")
-	time.Sleep(2 * time.Second)
-
-	// ═══════════════════════════════════════
-	// TEST 5: Leveled Compaction
-	// ═══════════════════════════════════════
-	log.Println()
-	log.Println("┌─────────────────────────────────────────┐")
-	log.Println("│  TEST 5: Leveled Compaction             │")
-	log.Println("└─────────────────────────────────────────┘")
-
-	plan := director.MaybePlan()
-	if plan == nil {
-		log.Println("  ✗ No compaction plan generated")
-	} else {
-		log.Printf("  ✓ Compaction Plan Generated")
-		log.Printf("    Trigger:      %s", plan.Reason)
-
-		compactStart := time.Now()
-		newSeg, err := executor.Execute(plan)
-		if err != nil {
-			panic(err)
-		}
-		compactDuration := time.Since(compactStart)
-
-		log.Printf("  ✓ Compaction Complete")
-		log.Printf("    New Segment:  %s", newSeg.ID[:8]+"...")
-		log.Printf("    Strategy:     %s", strategyToString(newSeg.Strategy))
-		log.Printf("    Duration:     %v", compactDuration)
-
-		// Record compaction
-		metrics.Record(MetricEvent{
-			EventType:   "compaction",
-			SegmentID:   newSeg.ID[:8],
-			Strategy:    strategyToString(newSeg.Strategy),
-			SegmentSize: newSeg.Length,
-			Details:     fmt.Sprintf("leveled compaction in %v: %s", compactDuration, plan.Reason),
-		})
-	}
-
-	// ═══════════════════════════════════════
-	// TEST 6: Additional Operations
-	// ═══════════════════════════════════════
-	log.Println()
-	log.Println("┌─────────────────────────────────────────┐")
-	log.Println("│  TEST 6: Additional Operations          │")
-	log.Println("└─────────────────────────────────────────┘")
-
-	const numWrites = 200
-	log.Printf("Simulating %d writes...", numWrites)
-
-	currentSeg = meta.GetAllSegments()[0]
-	for i := 0; i < numWrites; i++ {
-		meta.UpdateStats(currentSeg.ID, 0, 1)
-	}
-
-	currentSeg = meta.GetAllSegments()[0]
-	log.Printf("  Write Count:     %d", currentSeg.WriteCount)
-	log.Printf("  Read Count:      %d", currentSeg.ReadCount)
-
-	// Record write workload
-	metrics.Record(MetricEvent{
-		EventType:   "write_workload",
-		SegmentID:   currentSeg.ID[:8],
-		Strategy:    strategyToString(currentSeg.Strategy),
-		ReadCount:   currentSeg.ReadCount,
-		WriteCount:  currentSeg.WriteCount,
-		SegmentSize: currentSeg.Length,
-		Details:     fmt.Sprintf("%d additional writes", numWrites),
-	})
-
-	// ═══════════════════════════════════════
-	// TEST 7: Final Integrity Check
-	// ═══════════════════════════════════════
-	log.Println()
-	log.Println("┌─────────────────────────────────────────┐")
-	log.Println("│  TEST 7: Final Integrity Check          │")
-	log.Println("└─────────────────────────────────────────┘")
-
-	finalSegs := meta.GetAllSegments()
-	log.Printf("  Active Segments: %d", len(finalSegs))
-
-	if len(finalSegs) > 0 {
-		seg := finalSegs[0]
-		log.Printf("  Final Segment:")
-		log.Printf("    ID:       %s", seg.ID[:8]+"...")
-		log.Printf("    Strategy: %s", strategyToString(seg.Strategy))
-		log.Printf("    Size:     %d bytes", seg.Length)
-		log.Printf("    Keys:     [%s → %s]", seg.MinKey, seg.MaxKey)
-
-		// Verify all keys still readable
-		failCount = 0
-		for i := 0; i < numKeys; i++ {
-			key := fmt.Sprintf("key-%06d", i)
-			expectedVal := fmt.Sprintf("value-%06d", i)
-
-			val, ok := sstReader.Get(seg, key)
-			if !ok || string(val) != expectedVal {
-				failCount++
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			*physicalBytes += seg.Length
+			meta.RegisterSegment(seg)
+			// ALWAYS compact in leveled
+			if plan := director.MaybePlan(); plan != nil {
+				newSeg, _ := executor.Execute(plan)
+				*physicalBytes += newSeg.Length
+				*compactionCount++
 			}
 		}
 
-		if failCount > 0 {
-			log.Printf("  ✗ Integrity check FAILED: %d errors", failCount)
-			panic("Data corruption detected")
-		} else {
-			log.Printf("  ✓ Integrity verified: all %d keys correct", numKeys)
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Written: %d/%d (%.1f%%)\r", i, numKeys, float64(i)*100/float64(numKeys))
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		*physicalBytes += seg.Length
+		meta.RegisterSegment(seg)
+		// ALWAYS compact in leveled
+		if plan := director.MaybePlan(); plan != nil {
+			newSeg, _ := executor.Execute(plan)
+			*physicalBytes += newSeg.Length
+			*compactionCount++
 		}
 	}
 
-	// ═══════════════════════════════════════
-	// Final Summary
-	// ═══════════════════════════════════════
-	log.Println()
-	log.Println("╔════════════════════════════════════════╗")
-	log.Println("║          Evidence Summary              ║")
-	log.Println("╚════════════════════════════════════════╝")
-	log.Printf("  Total Keys:         %d", numKeys)
-	log.Printf("  Total Reads:        %d", numReads)
-	log.Printf("  Total Writes:       %d", numWrites)
-	log.Printf("  Compactions:        Static Leveled")
-	log.Printf("  Final Strategy:     %s", strategyToString(finalSegs[0].Strategy))
-	log.Printf("  Data Integrity:     ✓ VERIFIED")
-	log.Println()
-	log.Printf("  📊 Metrics saved to: metrics.csv")
-	log.Println()
-	log.Println("  ✓ All tests passed successfully!")
-	log.Println()
+	phase1Duration := time.Since(phase1Start)
+	phase1WA := float64(*physicalBytes) / float64(*logicalBytes)
+	phases = append(phases, PhaseResult{
+		Name:     "write",
+		Duration: phase1Duration.Seconds(),
+		WA:       phase1WA,
+		RA:       0,
+	})
+
+	fmt.Printf("  Segments: %d\n", len(meta.GetAllSegments()))
+	fmt.Printf("  Duration: %v\n", phase1Duration)
+
+	// PHASE 2: Read
+	fmt.Println("\n=== PHASE 2: Read (3x) ===")
+	time.Sleep(2 * time.Second)
+
+	phase2Start := time.Now()
+	numReads := numKeys * 3
+
+	for i := 0; i < numReads; i++ {
+		key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+		segs := meta.GetAllSegments()
+
+		*totalReads++
+		found := false
+		for _, seg := range segs {
+			*totalSegmentScans++
+			if !found && key >= seg.MinKey && key <= seg.MaxKey {
+				sstReader.Get(seg, key)
+				meta.UpdateStats(seg.ID, 1, 0)
+				found = true
+			}
+		}
+
+		if i > 0 && i%500000 == 0 {
+			fmt.Printf("  Reads: %d/%d (%.1f%%)\r", i, numReads, float64(i)*100/float64(numReads))
+		}
+	}
+	fmt.Println()
+
+	phase2Duration := time.Since(phase2Start)
+	phase2RA := float64(*totalSegmentScans) / float64(*totalReads)
+	phases = append(phases, PhaseResult{
+		Name:     "read",
+		Duration: phase2Duration.Seconds(),
+		WA:       phase1WA,
+		RA:       phase2RA,
+	})
+
+	fmt.Printf("  Current RA: %.2f\n", phase2RA)
+	fmt.Printf("  Duration: %v\n", phase2Duration)
+
+	// Try compaction
+	time.Sleep(2 * time.Second)
+	if plan := director.MaybePlan(); plan != nil {
+		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
+		newSeg, _ := executor.Execute(plan)
+		*physicalBytes += newSeg.Length
+		*compactionCount++
+		fmt.Printf("  New strategy: %v\n", newSeg.Strategy)
+	}
+
+	// PHASE 3: Write again
+	fmt.Println("\n=== PHASE 3: Write (50%) ===")
+	phase3Start := time.Now()
+
+	for i := 0; i < numKeys/2; i++ {
+		key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			*physicalBytes += seg.Length
+			meta.RegisterSegment(seg)
+			// ALWAYS compact in leveled
+			if plan := director.MaybePlan(); plan != nil {
+				newSeg, _ := executor.Execute(plan)
+				*physicalBytes += newSeg.Length
+				*compactionCount++
+			}
+		}
+
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Written: %d/%d (%.1f%%)\r", i, numKeys/2, float64(i)*100/float64(numKeys/2))
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		*physicalBytes += seg.Length
+		meta.RegisterSegment(seg)
+		// ALWAYS compact in leveled
+		if plan := director.MaybePlan(); plan != nil {
+			newSeg, _ := executor.Execute(plan)
+			*physicalBytes += newSeg.Length
+			*compactionCount++
+		}
+	}
+
+	phase3Duration := time.Since(phase3Start)
+	phase3WA := float64(*physicalBytes) / float64(*logicalBytes)
+	phases = append(phases, PhaseResult{
+		Name:     "write2",
+		Duration: phase3Duration.Seconds(),
+		WA:       phase3WA,
+		RA:       phase2RA,
+	})
+
+	fmt.Printf("  Duration: %v\n", phase3Duration)
+
+	// Try compaction again
+	time.Sleep(2 * time.Second)
+	if plan := director.MaybePlan(); plan != nil {
+		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
+		newSeg, _ := executor.Execute(plan)
+		*physicalBytes += newSeg.Length
+		*compactionCount++
+		fmt.Printf("  New strategy: %v\n", newSeg.Strategy)
+	}
+
+	return phases
+}
+
+func runPureWrite(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
+	sstWriter writer.SSTableWriter, director compaction.Director, executor compaction.Executor,
+	numKeys, valueSize int, logicalBytes, physicalBytes *int64, compactionCount *int) {
+
+	fmt.Println("=== PURE WRITE WORKLOAD ===")
+
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%010d", i)
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			*physicalBytes += seg.Length
+			meta.RegisterSegment(seg)
+			// ALWAYS compact in leveled
+			if plan := director.MaybePlan(); plan != nil {
+				newSeg, _ := executor.Execute(plan)
+				*physicalBytes += newSeg.Length
+				*compactionCount++
+			}
+		}
+
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Progress: %d/%d (%.1f%%)\r", i, numKeys, float64(i)*100/float64(numKeys))
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		*physicalBytes += seg.Length
+		meta.RegisterSegment(seg)
+		// ALWAYS compact in leveled
+		if plan := director.MaybePlan(); plan != nil {
+			newSeg, _ := executor.Execute(plan)
+			*physicalBytes += newSeg.Length
+			*compactionCount++
+		}
+	}
+}
+
+func runPureRead(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
+	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
+	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64) {
+
+	fmt.Println("=== PURE READ WORKLOAD ===")
+
+	// Phase 1: Populate
+	fmt.Println("Populating data...")
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%010d", i)
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			meta.RegisterSegment(seg)
+			w.Truncate()
+		}
+
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Populated: %d/%d (%.1f%%)\r", i, numKeys, float64(i)*100/float64(numKeys))
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		meta.RegisterSegment(seg)
+	}
+
+	// Reset counters (don't count population)
+	*logicalBytes = 0
+	*physicalBytes = 0
+
+	// Phase 2: Read
+	fmt.Println("Reading (3x)...")
+	numReads := numKeys * 3
+
+	for i := 0; i < numReads; i++ {
+		key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+		segs := meta.GetAllSegments()
+
+		*totalReads++
+		found := false
+		for _, seg := range segs {
+			*totalSegmentScans++
+			if !found && key >= seg.MinKey && key <= seg.MaxKey {
+				sstReader.Get(seg, key)
+				found = true
+			}
+		}
+
+		if i > 0 && i%500000 == 0 {
+			fmt.Printf("  Progress: %d/%d (%.1f%%)\r", i, numReads, float64(i)*100/float64(numReads))
+		}
+	}
+	fmt.Println()
+}
+
+func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
+	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
+	director compaction.Director, executor compaction.Executor,
+	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
+	compactionCount *int) {
+
+	fmt.Println("=== MIXED WORKLOAD (50/50) ===")
+
+	// Populate
+	fmt.Println("Populating...")
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%010d", i)
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			*physicalBytes += seg.Length
+			meta.RegisterSegment(seg)
+			w.Truncate()
+		}
+
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numKeys)
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		*physicalBytes += seg.Length
+		meta.RegisterSegment(seg)
+	}
+
+	// Mixed operations
+	fmt.Println("Running mixed operations...")
+	numOps := numKeys * 2
+
+	for i := 0; i < numOps; i++ {
+		if rand.Float32() < 0.5 {
+			// Write
+			key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+			val := make([]byte, valueSize)
+			rand.Read(val)
+
+			w.LogPut(key, val)
+			mem.Put(key, val)
+			*logicalBytes += int64(len(key) + valueSize)
+
+			if mem.ShouldFlush() {
+				data := mem.Flush()
+				seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+				*physicalBytes += seg.Length
+				meta.RegisterSegment(seg)
+				w.Truncate()
+			}
+		} else {
+			// Read
+			key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+			segs := meta.GetAllSegments()
+
+			*totalReads++
+			found := false
+			for _, seg := range segs {
+				*totalSegmentScans++
+				if !found && key >= seg.MinKey && key <= seg.MaxKey {
+					sstReader.Get(seg, key)
+					meta.UpdateStats(seg.ID, 1, 0)
+					found = true
+				}
+			}
+		}
+
+		if i > 0 && i%200000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numOps)
+		}
+	}
+	fmt.Println()
+
+	// Compaction
+	time.Sleep(2 * time.Second)
+	if plan := director.MaybePlan(); plan != nil {
+		newSeg, _ := executor.Execute(plan)
+		*physicalBytes += newSeg.Length
+		*compactionCount++
+	}
+}
+
+func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
+	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
+	director compaction.Director, executor compaction.Executor,
+	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
+	compactionCount *int) {
+
+	fmt.Println("=== READ-HEAVY WORKLOAD (95% reads) ===")
+
+	// Populate
+	fmt.Println("Populating...")
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%010d", i)
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			*physicalBytes += seg.Length
+			meta.RegisterSegment(seg)
+			w.Truncate()
+		}
+
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numKeys)
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		*physicalBytes += seg.Length
+		meta.RegisterSegment(seg)
+	}
+
+	// Operations (95% read)
+	fmt.Println("Running read-heavy operations...")
+	numOps := numKeys * 2
+
+	for i := 0; i < numOps; i++ {
+		if rand.Float32() < 0.95 {
+			// Read
+			key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+			segs := meta.GetAllSegments()
+
+			*totalReads++
+			found := false
+			for _, seg := range segs {
+				*totalSegmentScans++
+				if !found && key >= seg.MinKey && key <= seg.MaxKey {
+					sstReader.Get(seg, key)
+					meta.UpdateStats(seg.ID, 1, 0)
+					found = true
+				}
+			}
+		} else {
+			// Write
+			key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+			val := make([]byte, valueSize)
+			rand.Read(val)
+
+			w.LogPut(key, val)
+			mem.Put(key, val)
+			*logicalBytes += int64(len(key) + valueSize)
+
+			if mem.ShouldFlush() {
+				data := mem.Flush()
+				seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+				*physicalBytes += seg.Length
+				meta.RegisterSegment(seg)
+				w.Truncate()
+			}
+		}
+
+		if i > 0 && i%200000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numOps)
+		}
+	}
+	fmt.Println()
+
+	// Compaction
+	time.Sleep(2 * time.Second)
+	if plan := director.MaybePlan(); plan != nil {
+		newSeg, _ := executor.Execute(plan)
+		*physicalBytes += newSeg.Length
+		*compactionCount++
+	}
+}
+
+func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
+	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
+	director compaction.Director, executor compaction.Executor,
+	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
+	compactionCount *int) {
+
+	fmt.Println("=== WRITE-HEAVY WORKLOAD (95% writes) ===")
+
+	// Populate
+	fmt.Println("Populating...")
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%010d", i)
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			*physicalBytes += seg.Length
+			meta.RegisterSegment(seg)
+			w.Truncate()
+		}
+
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numKeys)
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		*physicalBytes += seg.Length
+		meta.RegisterSegment(seg)
+	}
+
+	// Operations (95% write)
+	fmt.Println("Running write-heavy operations...")
+	numOps := numKeys * 2
+
+	for i := 0; i < numOps; i++ {
+		if rand.Float32() < 0.95 {
+			// Write
+			key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+			val := make([]byte, valueSize)
+			rand.Read(val)
+
+			w.LogPut(key, val)
+			mem.Put(key, val)
+			*logicalBytes += int64(len(key) + valueSize)
+
+			if mem.ShouldFlush() {
+				data := mem.Flush()
+				seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+				*physicalBytes += seg.Length
+				meta.RegisterSegment(seg)
+				// ALWAYS compact in leveled
+				if plan := director.MaybePlan(); plan != nil {
+					newSeg, _ := executor.Execute(plan)
+					*physicalBytes += newSeg.Length
+					*compactionCount++
+				}
+			}
+		} else {
+			// Read
+			key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+			segs := meta.GetAllSegments()
+
+			*totalReads++
+			found := false
+			for _, seg := range segs {
+				*totalSegmentScans++
+				if !found && key >= seg.MinKey && key <= seg.MaxKey {
+					sstReader.Get(seg, key)
+					found = true
+				}
+			}
+		}
+
+		if i > 0 && i%200000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numOps)
+		}
+	}
+	fmt.Println()
+
+	// Compaction
+	time.Sleep(2 * time.Second)
+	if plan := director.MaybePlan(); plan != nil {
+		newSeg, _ := executor.Execute(plan)
+		*physicalBytes += newSeg.Length
+		*compactionCount++
+	}
+}
+
+func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
+	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
+	director compaction.Director, executor compaction.Executor,
+	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
+	compactionCount *int) {
+	fmt.Println("=== ZIPFIAN WORKLOAD (hot keys, s=1.5) ===")
+
+	// Phase 1: Write (sequential)
+	fmt.Println("Populating data...")
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%010d", i)
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			*physicalBytes += seg.Length
+			meta.RegisterSegment(seg)
+			w.Truncate()
+		}
+
+		if i > 0 && i%100000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numKeys)
+		}
+	}
+	fmt.Println()
+
+	// Final flush
+	if mem.ShouldFlush() {
+		data := mem.Flush()
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		*physicalBytes += seg.Length
+		meta.RegisterSegment(seg)
+	}
+
+	// Phase 2: Zipfian reads
+	fmt.Println("Reading with Zipfian distribution (s=1.5)...")
+	numReads := numKeys * 3
+	hotKeyAccesses := make(map[int]int)
+
+	for i := 0; i < numReads; i++ {
+		keyIdx := zipfian(numKeys, 1.5)
+		hotKeyAccesses[keyIdx]++
+
+		key := fmt.Sprintf("key-%010d", keyIdx)
+		segs := meta.GetAllSegments()
+
+		*totalReads++
+		found := false
+		for _, seg := range segs {
+			*totalSegmentScans++
+			if !found && key >= seg.MinKey && key <= seg.MaxKey {
+				sstReader.Get(seg, key)
+				meta.UpdateStats(seg.ID, 1, 0)
+				found = true
+			}
+		}
+
+		if i > 0 && i%500000 == 0 {
+			fmt.Printf("  Progress: %d/%d\r", i, numReads)
+		}
+	}
+	fmt.Println()
+
+	// Report hot key stats
+	top10Percent := 0
+	for i := 0; i < numKeys/10; i++ {
+		top10Percent += hotKeyAccesses[i]
+	}
+	fmt.Printf("  Hot key distribution: Top 10%% of keys = %d%% of accesses\n",
+		top10Percent*100/numReads)
+
+	// Compaction
+	time.Sleep(2 * time.Second)
+	if plan := director.MaybePlan(); plan != nil {
+		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
+		newSeg, _ := executor.Execute(plan)
+		*physicalBytes += newSeg.Length
+		*compactionCount++
+	}
 }
