@@ -1,9 +1,9 @@
 package compaction
 
 import (
-	"amethyst/internal/benchmarks" // Import the rules you wrote
 	"amethyst/internal/common"
 	"amethyst/internal/metadata"
+	"amethyst/internal/controller"
 )
 
 type Plan struct {
@@ -32,11 +32,19 @@ func NewDirector(meta metadata.Tracker, ctrl Controller) *director {
 	}
 }
 
-// NewDefaultDirector now officially uses your Leveled strategy
+// NewDefaultDirector uses the LeveledController
 func NewDefaultDirector(meta metadata.Tracker) *director {
 	return &director{
 		meta: meta,
-		ctrl: benchmarks.NewLeveledController(),
+		ctrl: controller.NewLeveledController(),
+	}
+}
+
+// NewLeveledDirector explicitly uses leveled compaction strategy
+func NewLeveledDirector(meta metadata.Tracker) *director {
+	return &director{
+		meta: meta,
+		ctrl: controller.NewLeveledController(),
 	}
 }
 
@@ -48,18 +56,47 @@ func (d *director) MaybePlan() *Plan {
 			continue
 		}
 
-		// Always use the controller logic from benchmarks/leveled.go
 		should, newStrategy, reason := d.ctrl.ShouldRewrite(seg)
 
 		if !should {
 			continue
 		}
 
+		// LEVELED: must collect ALL overlapping segments to maintain level invariant
+		inputs := d.collectAllOverlaps(seg)
+
 		return &Plan{
-			Inputs:         []*common.SegmentMeta{seg},
+			Inputs:         inputs,
 			OutputStrategy: newStrategy,
 			Reason:         reason,
 		}
 	}
 	return nil
+}
+
+// collectAllOverlaps recursively finds all segments that overlap with the target
+// This is critical for leveled compaction: you must compact overlapping files together
+func (d *director) collectAllOverlaps(target *common.SegmentMeta) []*common.SegmentMeta {
+	inputs := []*common.SegmentMeta{target}
+	seen := make(map[string]bool)
+	seen[target.ID] = true
+
+	// Iteratively expand the set of inputs until no new overlaps are found
+	changed := true
+	for changed {
+		changed = false
+		// For each segment currently in inputs, find all segments that overlap with it
+		for _, input := range inputs {
+			overlaps := d.meta.GetOverlappingSegments(input)
+			for _, overlap := range overlaps {
+				if !seen[overlap.ID] {
+					inputs = append(inputs, overlap)
+					seen[overlap.ID] = true
+					changed = true
+				}
+			}
+		}
+	}
+
+	return inputs
 }

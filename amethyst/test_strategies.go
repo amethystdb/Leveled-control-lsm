@@ -1,9 +1,9 @@
 package main
 
 import (
-	"amethyst/internal/benchmarks"
 	"amethyst/internal/common"
 	"amethyst/internal/compaction"
+	"amethyst/internal/controller"
 	"amethyst/internal/memtable"
 	"amethyst/internal/metadata"
 	"amethyst/internal/segmentfile"
@@ -45,7 +45,7 @@ func runStrategy(strategyName string, ctrl compaction.Controller) {
 
 	// Write initial data
 	log.Println("Writing 500 keys...")
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 30000; i++ {
 		key := fmt.Sprintf("key-%06d", i)
 		val := []byte(fmt.Sprintf("value-%06d", i))
 		w.LogPut(key, val)
@@ -64,7 +64,7 @@ func runStrategy(strategyName string, ctrl compaction.Controller) {
 	currentSeg := meta.GetAllSegments()[0]
 
 	log.Println("\nSimulating read-heavy workload...")
-	for i := 0; i < 15; i++ {
+	for i := 0; i < 20000; i++ {
 		key := fmt.Sprintf("key-%06d", i%500)
 		sstReader.Get(currentSeg, key)
 		meta.UpdateStats(currentSeg.ID, 1, 0)
@@ -118,7 +118,7 @@ func main() {
 	log.Println("Testing Leveled Compaction Strategy")
 
 	// Test Static Leveled
-	runStrategy("Static Leveled", benchmarks.NewLeveledController())
+	runStrategy("Static Leveled", controller.NewLeveledController())
 
 	log.Println("\n✓ Leveled strategy test complete!")
 }

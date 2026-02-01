@@ -31,17 +31,19 @@ func NewExecutor(
 }
 
 func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
-	input := plan.Inputs[0]
 	merged := make(map[string][]byte)
 
-	// Scan all input segments and merge (last write wins)
-	for _, seg := range plan.Inputs {
+	// CRITICAL: Process from oldest to newest so newer values override older ones
+	// Since metadata.ordered is newest-first, we need to reverse iteration
+	// Process oldest first (end of list) → newest last (start of list)
+	for i := len(plan.Inputs) - 1; i >= 0; i-- {
+		seg := plan.Inputs[i]
 		data, err := e.reader.Scan(seg)
 		if err != nil {
 			return nil, err
 		}
 
-		// Merge: later segments in the list override earlier ones
+		// Merge: write to map, newer values will override
 		for k, v := range data {
 			merged[k] = v
 		}
@@ -59,6 +61,8 @@ func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
 		e.meta.MarkObsolete(seg.ID)
 	}
 
-	log.Printf("REWRITE %v → %v (%s)", input.Strategy, newSeg.Strategy, plan.Reason)
+	strategyName := "LEVELED"
+
+	log.Printf("COMPACT %d segments → %s strategy (%s)", len(plan.Inputs), strategyName, plan.Reason)
 	return newSeg, nil
 }

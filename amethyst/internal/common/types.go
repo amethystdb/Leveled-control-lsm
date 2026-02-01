@@ -4,8 +4,7 @@ type CompactionType int
 
 const (
 	// Keep these identical across all repos for standard results
-	TIERED  CompactionType = iota // 0
-	LEVELED                       // 1
+	LEVELED CompactionType = iota // 1
 )
 
 type SegmentMeta struct {

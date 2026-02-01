@@ -6,6 +6,7 @@ type Tracker interface {
 	RegisterSegment(meta *common.SegmentMeta)
 	GetSegmentsForKey(key string) []*common.SegmentMeta
 	GetAllSegments() []*common.SegmentMeta
+	GetOverlappingSegments(target *common.SegmentMeta) []*common.SegmentMeta
 
 	MarkObsolete(id string)
 	UpdateStats(id string, reads int64, writes int64)
@@ -25,20 +26,23 @@ func NewTracker() Tracker {
 }
 
 func (t *tracker) RegisterSegment(meta *common.SegmentMeta) {
-	// 1. Calculate overlap count before registering
+	// Calculate overlap count - count how many existing segments overlap with this new one
 	var overlaps int64
 	for _, other := range t.ordered {
 		if other.Obsolete {
 			continue
 		}
-		// Range overlap check: Not (A is entirely before B OR A is entirely after B)
+		// Range overlap check: NOT (A is entirely before B OR A is entirely after B)
+		// If ranges overlap, increment count
 		if !(meta.MaxKey < other.MinKey || meta.MinKey > other.MaxKey) {
 			overlaps++
+			// BIDIRECTIONAL: also increment the other segment's overlap count
+			other.OverlapCount++
 		}
 	}
 	meta.OverlapCount = overlaps
 
-	// 2. Register the segment
+	// Register the segment
 	t.segments[meta.ID] = meta
 	// prepend so newest segments come first
 	t.ordered = append([]*common.SegmentMeta{meta}, t.ordered...)
@@ -63,6 +67,22 @@ func (t *tracker) GetAllSegments() []*common.SegmentMeta {
 
 	for _, seg := range t.ordered {
 		if !seg.Obsolete {
+			result = append(result, seg)
+		}
+	}
+	return result
+}
+
+// GetOverlappingSegments returns all non-obsolete segments that overlap with the target segment
+func (t *tracker) GetOverlappingSegments(target *common.SegmentMeta) []*common.SegmentMeta {
+	result := make([]*common.SegmentMeta, 0)
+
+	for _, seg := range t.ordered {
+		if seg.Obsolete || seg.ID == target.ID {
+			continue
+		}
+		// Check if seg overlaps with target
+		if !(seg.MaxKey < target.MinKey || seg.MinKey > target.MaxKey) {
 			result = append(result, seg)
 		}
 	}
