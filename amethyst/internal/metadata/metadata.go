@@ -1,6 +1,9 @@
 package metadata
 
-import "amethyst/internal/common"
+import (
+	"amethyst/internal/common"
+	"sync"
+)
 
 type Tracker interface {
 	RegisterSegment(meta *common.SegmentMeta)
@@ -13,6 +16,7 @@ type Tracker interface {
 }
 
 type tracker struct {
+	mu       sync.RWMutex
 	segments map[string]*common.SegmentMeta
 	ordered  []*common.SegmentMeta // newest first ordered
 }
@@ -26,6 +30,9 @@ func NewTracker() Tracker {
 }
 
 func (t *tracker) RegisterSegment(meta *common.SegmentMeta) {
+	t.mu.Lock() // MUST acquire write lock to modify internal maps and slices
+	defer t.mu.Unlock()
+
 	// Calculate overlap count - count how many existing segments overlap with this new one
 	var overlaps int64
 	for _, other := range t.ordered {
@@ -63,8 +70,10 @@ func (t *tracker) GetSegmentsForKey(key string) []*common.SegmentMeta {
 }
 
 func (t *tracker) GetAllSegments() []*common.SegmentMeta {
-	result := make([]*common.SegmentMeta, 0, len(t.ordered))
+	t.mu.RLock() // Add read lock
+	defer t.mu.RUnlock()
 
+	result := make([]*common.SegmentMeta, 0, len(t.ordered))
 	for _, seg := range t.ordered {
 		if !seg.Obsolete {
 			result = append(result, seg)
@@ -75,13 +84,19 @@ func (t *tracker) GetAllSegments() []*common.SegmentMeta {
 
 // GetOverlappingSegments returns all non-obsolete segments that overlap with the target segment
 func (t *tracker) GetOverlappingSegments(target *common.SegmentMeta) []*common.SegmentMeta {
-	result := make([]*common.SegmentMeta, 0)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 
+	result := make([]*common.SegmentMeta, 0)
 	for _, seg := range t.ordered {
+		// Don't overlap with yourself or obsolete files
 		if seg.Obsolete || seg.ID == target.ID {
 			continue
 		}
-		// Check if seg overlaps with target
+
+		// THE CORE LEVELED LOGIC:
+		// Check if the ranges [min, max] intersect
+		// They overlap UNLESS (seg is entirely to the left) OR (seg is entirely to the right)
 		if !(seg.MaxKey < target.MinKey || seg.MinKey > target.MaxKey) {
 			result = append(result, seg)
 		}

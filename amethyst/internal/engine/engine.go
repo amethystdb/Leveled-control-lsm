@@ -48,21 +48,23 @@ func (e *Engine) Put(key string, value []byte) error {
 func (e *Engine) ExecuteFlush() error {
 	fmt.Println("Threshold reached: Starting Flush Plumbing...")
 
-	//Get sorted data from Memtable
 	data := e.mem.Flush()
+	if len(data) == 0 {
+		return nil
+	}
 
-	//Hand off to the SSTable Writer (The disk storage logic)
-	//LEVELED strategy for new flushes
-	_, err := e.writer.WriteSegment(data, common.LEVELED)
+	// Assign to 'seg' and actually use it (or use _ if you really don't need it)
+	seg, err := e.writer.WriteSegment(data, common.LEVELED)
 	if err != nil {
 		return fmt.Errorf("SSTable write failure: %w", err)
 	}
 
-	// only truncate WAL after disk write is confirmed
+	// LOG OR REGISTER 'seg' TO REMOVE THE COMPILER ERROR
+	fmt.Printf("Created new Leveled segment: %s (Size: %d bytes)\n", seg.ID, seg.Length)
+
 	if err := e.wal.Truncate(); err != nil {
 		return fmt.Errorf("WAL cleanup failure: %w", err)
 	}
 
-	fmt.Println("Flush complete: Memtable cleared and WAL truncated.")
 	return nil
 }

@@ -5,14 +5,14 @@ import (
 	"amethyst/internal/segmentfile"
 	"amethyst/internal/sparseindex"
 	"encoding/binary"
-	"github.com/google/uuid"
-	"sort"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type SSTableWriter interface {
 	WriteSegment(
-		sortedData map[string][]byte,
+		sortedData []common.KVEntry,
 		strategy common.CompactionType,
 	) (*common.SegmentMeta, error)
 }
@@ -30,7 +30,7 @@ func NewWriter(fileMgr segmentfile.SegmentFileManager, indexBuilder sparseindex.
 }
 
 func (w *writer) WriteSegment(
-	sortedData map[string][]byte,
+	sortedData []common.KVEntry,
 	strategy common.CompactionType,
 ) (*common.SegmentMeta, error) {
 	segmentID := uuid.New().String()
@@ -48,24 +48,11 @@ func (w *writer) WriteSegment(
 	writeString(segmentID)
 
 	var minKey, maxKey string
-	first := true
-
-	keys := make([]string, 0, len(sortedData))
-	for k := range sortedData {
-		keys = append(keys, k)
+	if len(sortedData) > 0 {
+		minKey = sortedData[0].Key
+		maxKey = sortedData[len(sortedData)-1].Key
 	}
 
-	sort.Strings(keys)
-
-	//keys are sorted by memtable contract
-	for _, key := range keys {
-		if first {
-			minKey = key
-			first = false
-
-		}
-		maxKey = key
-	}
 	writeString(minKey)
 	writeString(maxKey)
 	buf = append(buf, byte(strategy))
@@ -74,29 +61,33 @@ func (w *writer) WriteSegment(
 	buf = append(buf, tmp8...)
 
 	//actual data entry
-	offsets := make([]int64, 0, len(keys))
+	offsetsForIndex := make([]int64, 0, len(sortedData))
+	keysForIndex := make([]string, 0, len(sortedData))
 	dataStartOffset := int64(len(buf))
 
-	for _, key := range keys {
-		offsets = append(offsets, int64(len(buf))-dataStartOffset)
-		val := sortedData[key]
-		tombstone := val == nil
+	// 3. Data Entry Loop
+	for _, entry := range sortedData {
+		offsetsForIndex = append(offsetsForIndex, int64(len(buf))-dataStartOffset)
+		keysForIndex = append(keysForIndex, entry.Key)
 
+		// Write Lengths (4 bytes key, 4 bytes value) + 1 byte Tombstone
 		tmp := make([]byte, 9)
-		binary.BigEndian.PutUint32(tmp[0:4], uint32(len(key)))
-		binary.BigEndian.PutUint32(tmp[4:8], uint32(len(val)))
-		if tombstone {
+		binary.BigEndian.PutUint32(tmp[0:4], uint32(len(entry.Key)))
+		binary.BigEndian.PutUint32(tmp[4:8], uint32(len(entry.Value)))
+
+		// Physically write the tombstone bit
+		if entry.Tombstone {
 			tmp[8] = 1
 		} else {
 			tmp[8] = 0
 		}
-		buf = append(buf, tmp...)
-		buf = append(buf, []byte(key)...)
-		buf = append(buf, val...)
 
+		buf = append(buf, tmp...)
+		buf = append(buf, []byte(entry.Key)...)
+		buf = append(buf, entry.Value...)
 	}
 	//sparseindex
-	sparse := w.indexBuilder.Build(keys, offsets)
+	sparse := w.indexBuilder.Build(keysForIndex, offsetsForIndex)
 	//serialize sparse index
 	sparseOffset := int64(len(buf))
 

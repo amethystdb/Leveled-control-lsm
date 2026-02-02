@@ -53,3 +53,10 @@ type WALEntry struct {
 	Value     []byte
 	Tombstone bool
 }
+
+// our odered key equivalentt
+type KVEntry struct {
+	Key       string
+	Value     []byte
+	Tombstone bool
+}

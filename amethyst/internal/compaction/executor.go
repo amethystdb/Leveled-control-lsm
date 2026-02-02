@@ -6,6 +6,7 @@ import (
 	"amethyst/internal/sstable/reader"
 	"amethyst/internal/sstable/writer"
 	"log"
+	"sort"
 )
 
 type Executor interface {
@@ -33,27 +34,42 @@ func NewExecutor(
 func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
 	merged := make(map[string][]byte)
 
-	// CRITICAL: Process from oldest to newest so newer values override older ones
-	// Since metadata.ordered is newest-first, we need to reverse iteration
-	// Process oldest first (end of list) → newest last (start of list)
+	// 1. Merge all input segments (Oldest to Newest)
 	for i := len(plan.Inputs) - 1; i >= 0; i-- {
 		seg := plan.Inputs[i]
 		data, err := e.reader.Scan(seg)
 		if err != nil {
 			return nil, err
 		}
-
-		// Merge: write to map, newer values will override
 		for k, v := range data {
 			merged[k] = v
 		}
 	}
 
-	// Write new segment with the target strategy
-	newSeg, err := e.writer.WriteSegment(merged, plan.OutputStrategy)
+	// 2. NEW: Extract and Sort Keys (SSTables must be sorted on disk)
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// 3. NEW: Convert Map to the []common.KVEntry Slice the Writer wants
+	finalEntries := make([]common.KVEntry, 0, len(keys))
+	for _, k := range keys {
+		val := merged[k]
+		finalEntries = append(finalEntries, common.KVEntry{
+			Key:       k,
+			Value:     val,
+			Tombstone: val == nil, // If value is nil, it's a delete!
+		})
+	}
+
+	// 4. Now pass 'finalEntries' (the slice) instead of 'merged' (the map)
+	newSeg, err := e.writer.WriteSegment(finalEntries, plan.OutputStrategy)
 	if err != nil {
 		return nil, err
 	}
+
 	e.meta.RegisterSegment(newSeg)
 
 	// Mark old segments obsolete

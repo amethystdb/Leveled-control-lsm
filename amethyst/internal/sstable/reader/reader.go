@@ -64,9 +64,13 @@ func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
 		}
 		key := string(keyBytes)
 
-		valBytes := make([]byte, vLen)
-		if _, err := buf.Read(valBytes); err != nil {
-			return nil, false
+		// APPLY THE FIX HERE TOO:
+		var valBytes []byte
+		if vLen > 0 {
+			valBytes = make([]byte, vLen)
+			if _, err := buf.Read(valBytes); err != nil {
+				return nil, false
+			}
 		}
 
 		if key == target {
@@ -85,11 +89,9 @@ func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
 	return nil, false
 }
 
-// Scan reads all non-deleted records from a segment
 func (r *Reader) Scan(meta *common.SegmentMeta) (map[string][]byte, error) {
 	result := make(map[string][]byte)
 
-	// Read entire data section
 	start := meta.Offset + meta.DataStartOffset
 	end := meta.Offset + meta.SparseIndexOffset
 
@@ -101,12 +103,11 @@ func (r *Reader) Scan(meta *common.SegmentMeta) (map[string][]byte, error) {
 	buf := bytes.NewReader(data)
 
 	for buf.Len() > 0 {
-		var kLen uint32
-		var vLen uint32
+		var kLen, vLen uint32
 		var tomb byte
 
 		if err := binary.Read(buf, binary.BigEndian, &kLen); err != nil {
-			break // End of valid data
+			break
 		}
 		if err := binary.Read(buf, binary.BigEndian, &vLen); err != nil {
 			break
@@ -121,16 +122,20 @@ func (r *Reader) Scan(meta *common.SegmentMeta) (map[string][]byte, error) {
 		}
 		key := string(keyBytes)
 
-		valBytes := make([]byte, vLen)
-		if _, err := buf.Read(valBytes); err != nil {
-			break
+		// THE FIX: Only read value if vLen > 0 to avoid Ghost EOF
+		var valBytes []byte
+		if vLen > 0 {
+			valBytes = make([]byte, vLen)
+			if _, err := buf.Read(valBytes); err != nil {
+				break
+			}
 		}
 
-		// Skip tombstoned records
-		if tomb == 0 {
+		if tomb == 1 {
+			result[key] = nil
+		} else {
 			result[key] = valBytes
 		}
 	}
-
 	return result, nil
 }
