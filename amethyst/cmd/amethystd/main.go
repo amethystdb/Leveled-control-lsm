@@ -117,7 +117,7 @@ func main() {
 	sstWriter := writer.NewWriter(fileMgr, indexBuilder)
 	sstReader := reader.NewReader(fileMgr)
 
-	director := compaction.NewLeveledDirector(meta)
+	director := compaction.NewDefaultDirector(meta)
 	executor := compaction.NewExecutor(meta, sstReader, sstWriter)
 
 	// Metrics tracking
