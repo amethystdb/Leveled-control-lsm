@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"amethyst/internal/common"
+	"sort"
 	"sync"
 )
 
@@ -18,7 +19,7 @@ type Tracker interface {
 type tracker struct {
 	mu       sync.RWMutex
 	segments map[string]*common.SegmentMeta
-	ordered  []*common.SegmentMeta // newest first ordered
+	ordered  []*common.SegmentMeta
 }
 
 // NewTracker creates a new MetadataTracker.
@@ -30,32 +31,17 @@ func NewTracker() Tracker {
 }
 
 func (t *tracker) RegisterSegment(meta *common.SegmentMeta) {
-	t.mu.Lock() // MUST acquire write lock to modify internal maps and slices
+	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Calculate overlap count - count how many existing segments overlap with this new one
-	var overlaps int64
-	for _, other := range t.ordered {
-		if other.Obsolete {
-			continue
-		}
-		// Range overlap check: NOT (A is entirely before B OR A is entirely after B)
-		// If ranges overlap, increment count
-		if !(meta.MaxKey < other.MinKey || meta.MinKey > other.MaxKey) {
-			overlaps++
-			// BIDIRECTIONAL: also increment the other segment's overlap count
-			other.OverlapCount++
-		}
-	}
-	meta.OverlapCount = overlaps
-
-	// Register the segment
 	t.segments[meta.ID] = meta
-	// prepend so newest segments come first
 	t.ordered = append([]*common.SegmentMeta{meta}, t.ordered...)
 }
 
 func (t *tracker) GetSegmentsForKey(key string) []*common.SegmentMeta {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	result := make([]*common.SegmentMeta, 0)
 
 	for _, seg := range t.ordered {
@@ -70,7 +56,7 @@ func (t *tracker) GetSegmentsForKey(key string) []*common.SegmentMeta {
 }
 
 func (t *tracker) GetAllSegments() []*common.SegmentMeta {
-	t.mu.RLock() // Add read lock
+	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	result := make([]*common.SegmentMeta, 0, len(t.ordered))
@@ -79,6 +65,12 @@ func (t *tracker) GetAllSegments() []*common.SegmentMeta {
 			result = append(result, seg)
 		}
 	}
+
+	// LEVELED REQUIREMENT: Sort by MinKey so Binary Search in main.go works
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].MinKey < result[j].MinKey
+	})
+
 	return result
 }
 
@@ -105,12 +97,18 @@ func (t *tracker) GetOverlappingSegments(target *common.SegmentMeta) []*common.S
 }
 
 func (t *tracker) MarkObsolete(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if seg, ok := t.segments[id]; ok {
 		seg.Obsolete = true
 	}
 }
 
 func (t *tracker) UpdateStats(id string, reads int64, writes int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if seg, ok := t.segments[id]; ok {
 		seg.ReadCount += reads
 		seg.WriteCount += writes
