@@ -9,8 +9,8 @@ import (
 // LEVELED CONTROLLER - Pure Leveled Compaction Strategy
 // ============================================================================
 // Leveled compaction favors read performance by maintaining non-overlapping
-// key ranges at each level. Triggers compaction when overlaps exist or when
-// reads are frequent (indicating hot data that should be optimized).
+// key ranges at each level. Triggers compaction ONLY when overlaps exist.
+// Reads are fast because segments don't overlap.
 
 type LeveledController struct{}
 
@@ -27,16 +27,15 @@ func (c *LeveledController) ShouldRewrite(meta *common.SegmentMeta) (bool, commo
 	}
 
 	// Overlap detection: if this segment overlaps with others, compact them together
-	// This is CRITICAL for leveled compaction - overlaps break the level invariant
+	// This is the ONLY trigger for leveled compaction
+	// Overlaps break the level invariant and slow down reads
 	if meta.OverlapCount > 0 {
 		return true, common.LEVELED, "Leveled: Overlaps detected, merging to maintain level invariant"
 	}
 
-	// Read-heavy detection: if a segment is being read frequently, compact it
-	// to optimize read path by removing old data
-	if meta.ReadCount > 10 {
-		return true, common.LEVELED, "Leveled: Hot segment (high read count), rewriting to consolidate"
-	}
+	// NOTE: Removed ReadCount > 10 trigger
+	// This was causing compactions on EVERY READ and crushing read performance
+	// Reads will naturally trigger compactions through overlap resolution
 
 	return false, common.LEVELED, ""
 }

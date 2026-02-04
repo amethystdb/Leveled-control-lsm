@@ -3,18 +3,23 @@ package segmentfile
 import (
 	"os"
 	"sync"
+	"syscall"
 )
 
 type SegmentFileManager interface {
 	Append(data []byte) (offset int64, length int64, err error)
 	ReadAt(offset int64, length int64) ([]byte, error)
 	Delete(offset int64) error
+	GetMmapData() ([]byte, error)
+	ReleaseMmap() error
 }
 
 type localFileManager struct {
-	file *os.File
-	path string //for Delete() to find file
-	mu   sync.Mutex
+	file      *os.File
+	path      string //for Delete() to find file
+	mu        sync.RWMutex
+	mmapData  []byte
+	isMMapped bool
 }
 
 func NewSegmentFileManager(path string) (SegmentFileManager, error) {
@@ -32,6 +37,13 @@ func NewSegmentFileManager(path string) (SegmentFileManager, error) {
 func (s *localFileManager) Append(data []byte) (int64, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Close mmap before writing to invalidate cache
+	if s.isMMapped && s.mmapData != nil {
+		syscall.Munmap(s.mmapData)
+		s.isMMapped = false
+		s.mmapData = nil
+	}
 
 	//current size to know the start offset
 	stat, err := s.file.Stat()
@@ -60,10 +72,67 @@ func (s *localFileManager) ReadAt(offset int64, length int64) ([]byte, error) {
 	return buf, nil
 }
 
+// GetMmapData returns memory-mapped data for efficient zero-copy access
+func (s *localFileManager) GetMmapData() ([]byte, error) {
+	s.mu.RLock()
+	if s.isMMapped && s.mmapData != nil {
+		defer s.mu.RUnlock()
+		return s.mmapData, nil
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if s.isMMapped && s.mmapData != nil {
+		return s.mmapData, nil
+	}
+
+	stat, err := s.file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	if stat.Size() == 0 {
+		return []byte{}, nil
+	}
+
+	data, err := syscall.Mmap(int(s.file.Fd()), 0, int(stat.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, err
+	}
+	s.mmapData = data
+	s.isMMapped = true
+
+	return s.mmapData, nil
+}
+
+// ReleaseMmap closes the mmap
+func (s *localFileManager) ReleaseMmap() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isMMapped && s.mmapData != nil {
+		if err := syscall.Munmap(s.mmapData); err != nil {
+			return err
+		}
+		s.isMMapped = false
+		s.mmapData = nil
+	}
+	return nil
+}
+
 // marks segment for removal
 func (s *localFileManager) Delete(offset int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isMMapped && s.mmapData != nil {
+		syscall.Munmap(s.mmapData)
+		s.isMMapped = false
+		s.mmapData = nil
+	}
 
 	if err := s.file.Close(); err != nil {
 		return err

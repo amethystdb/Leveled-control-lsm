@@ -35,6 +35,7 @@ func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
 	merged := make(map[string][]byte)
 
 	// 1. Merge all input segments (Oldest to Newest)
+	// Process in reverse so newer values override older ones
 	for i := len(plan.Inputs) - 1; i >= 0; i-- {
 		seg := plan.Inputs[i]
 		data, err := e.reader.Scan(seg)
@@ -46,25 +47,25 @@ func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
 		}
 	}
 
-	// 2. NEW: Extract and Sort Keys (SSTables must be sorted on disk)
+	// 2. Extract and Sort Keys (SSTables must be sorted on disk)
 	keys := make([]string, 0, len(merged))
 	for k := range merged {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	// 3. NEW: Convert Map to the []common.KVEntry Slice the Writer wants
+	// 3. Convert Map to KVEntry slice for writer
 	finalEntries := make([]common.KVEntry, 0, len(keys))
 	for _, k := range keys {
 		val := merged[k]
 		finalEntries = append(finalEntries, common.KVEntry{
 			Key:       k,
 			Value:     val,
-			Tombstone: val == nil, // If value is nil, it's a delete!
+			Tombstone: val == nil, // If value is nil, it's a delete
 		})
 	}
 
-	// 4. Now pass 'finalEntries' (the slice) instead of 'merged' (the map)
+	// 4. Write the sorted entries to disk
 	newSeg, err := e.writer.WriteSegment(finalEntries, plan.OutputStrategy)
 	if err != nil {
 		return nil, err

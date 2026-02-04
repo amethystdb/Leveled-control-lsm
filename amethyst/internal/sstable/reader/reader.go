@@ -32,15 +32,23 @@ func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Compute absolute start offset
-	start := meta.Offset + meta.DataStartOffset + idx.Seek(target)
-	end := meta.Offset + meta.SparseIndexOffset
-
-	data, err := r.fileMgr.ReadAt(start, end-start)
+	// Get mmapped data
+	mmapData, err := r.fileMgr.GetMmapData()
 	if err != nil {
 		return nil, false
 	}
 
+	// Compute absolute start offset
+	start := meta.Offset + meta.DataStartOffset + idx.Seek(target)
+	end := meta.Offset + meta.SparseIndexOffset
+
+	// Check bounds
+	if start < 0 || end > int64(len(mmapData)) || start > end {
+		return nil, false
+	}
+
+	// Use direct slice from mmap - zero copy!
+	data := mmapData[start:end]
 	buf := bytes.NewReader(data)
 
 	for buf.Len() > 0 {
@@ -64,7 +72,6 @@ func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
 		}
 		key := string(keyBytes)
 
-		// APPLY THE FIX HERE TOO:
 		var valBytes []byte
 		if vLen > 0 {
 			valBytes = make([]byte, vLen)
@@ -92,14 +99,22 @@ func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
 func (r *Reader) Scan(meta *common.SegmentMeta) (map[string][]byte, error) {
 	result := make(map[string][]byte)
 
-	start := meta.Offset + meta.DataStartOffset
-	end := meta.Offset + meta.SparseIndexOffset
-
-	data, err := r.fileMgr.ReadAt(start, end-start)
+	// Get mmapped data
+	mmapData, err := r.fileMgr.GetMmapData()
 	if err != nil {
 		return nil, err
 	}
 
+	start := meta.Offset + meta.DataStartOffset
+	end := meta.Offset + meta.SparseIndexOffset
+
+	// Check bounds
+	if start < 0 || end > int64(len(mmapData)) || start > end {
+		return nil, nil
+	}
+
+	// Use direct slice from mmap - zero copy!
+	data := mmapData[start:end]
 	buf := bytes.NewReader(data)
 
 	for buf.Len() > 0 {
@@ -122,7 +137,6 @@ func (r *Reader) Scan(meta *common.SegmentMeta) (map[string][]byte, error) {
 		}
 		key := string(keyBytes)
 
-		// THE FIX: Only read value if vLen > 0 to avoid Ghost EOF
 		var valBytes []byte
 		if vLen > 0 {
 			valBytes = make([]byte, vLen)
