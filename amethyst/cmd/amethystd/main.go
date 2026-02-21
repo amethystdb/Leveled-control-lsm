@@ -16,6 +16,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +26,7 @@ var (
 	numKeysFlag   = flag.Int("keys", 10000000, "Number of keys")
 	valueSizeFlag = flag.Int("value-size", 256, "Value size in bytes")
 	engineFlag    = flag.String("engine", "leveled", "Engine name for output")
+	ioLock        sync.Mutex
 )
 
 // Results structure for JSON output
@@ -115,7 +118,6 @@ func main() {
 	fmt.Printf("Workload: %s\n", *workloadFlag)
 	fmt.Printf("Keys:     %d\n", *numKeysFlag)
 	fmt.Printf("Value:    %d bytes\n", *valueSizeFlag)
-	fmt.Println()
 
 	// Initialize components
 	w, err := wal.NewDiskWAL("wal.log")
@@ -143,8 +145,36 @@ func main() {
 	var physicalBytes int64 = 0
 	var totalReads int64 = 0
 	var totalSegmentScans int64 = 0
-	compactionCount := 0
+	var compactionCount int64 = 0
 	var phases []PhaseResult
+
+	// === BACKGROUND COMPACTOR ===
+	stopCompaction := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second) // Wake up every 2 seconds
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// Keep compacting until the Leveled tree is perfectly organized
+				for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
+					ioLock.Lock()
+					newSeg, err := executor.Execute(plan)
+					ioLock.Unlock()
+
+					if err == nil && newSeg != nil {
+						atomic.AddInt64(&physicalBytes, newSeg.Length)
+						atomic.AddInt64(&compactionCount, 1)
+					}
+				}
+			case <-stopCompaction:
+				return
+			}
+		}
+	}()
+	// ============================
 
 	startTime := time.Now()
 
@@ -188,6 +218,10 @@ func main() {
 		fmt.Printf("Unknown workload: %s\n", *workloadFlag)
 		os.Exit(1)
 	}
+
+	// ADD THIS TO STOP THE THREAD
+	close(stopCompaction)
+	time.Sleep(2 * time.Second) // Give it a second to finish its last merge
 
 	totalDuration := time.Since(startTime)
 
@@ -234,7 +268,7 @@ func main() {
 		WriteAmplification: wa,
 		ReadAmplification:  ra,
 		SpaceAmplification: sa,
-		CompactionCount:    compactionCount,
+		CompactionCount:    int(compactionCount),
 		TotalDurationSec:   totalDuration.Seconds(),
 		LogicalBytes:       logicalBytes,
 		PhysicalBytes:      physicalBytes,
@@ -282,7 +316,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) []PhaseResult {
+	compactionCount *int64) []PhaseResult {
 
 	var phases []PhaseResult
 
@@ -301,9 +335,11 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
+			ioLock.Lock() // <--- 1. LOCK THE DISK
 			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
-			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
+			ioLock.Unlock() // <--- 2. UNLOCK THE DISK
+			*physicalBytes += int64(seg.Length)
 			w.Truncate()
 		}
 
@@ -322,6 +358,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		meta.RegisterSegment(seg)
 	}
 
+	phase3Start := time.Now() // Add this line to fix the undefined variable error
 	phase1Duration := time.Since(phase1Start)
 	phase1WA := float64(*physicalBytes) / float64(*logicalBytes)
 	phases = append(phases, PhaseResult{
@@ -357,8 +394,10 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		*totalReads++
 		seg := binarySearchSegment(segs, key)
 		if seg != nil {
-			*totalSegmentScans++ // <--- THIS is an actual file/SSTable probe!
+			*totalSegmentScans++
+			ioLock.Lock() // <--- 1. LOCK THE DISK FOR READING
 			sstReader.Get(seg, key)
+			ioLock.Unlock() // <--- 2. UNLOCK IT
 			meta.UpdateStats(seg.ID, 1, 0)
 		}
 
@@ -381,48 +420,14 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	fmt.Printf("  Current RA: %.2f\n", phase2RA)
 	fmt.Printf("  Duration: %v\n", phase2Duration)
 
-	// Post-Read Compaction Trigger
-	time.Sleep(2 * time.Second)
-	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
-		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-	}
-
-	// PHASE 3: Write again
-	fmt.Println("\n=== PHASE 3: Write (50%) ===")
-	phase3Start := time.Now()
-
-	for i := 0; i < numKeys/2; i++ {
-		key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
-		val := make([]byte, valueSize)
-		rand.Read(val)
-
-		w.LogPut(key, val)
-		mem.Put(key, val)
-		*logicalBytes += int64(len(key) + valueSize)
-
-		if mem.ShouldFlush() {
-			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
-			*physicalBytes += seg.Length
-			meta.RegisterSegment(seg)
-			w.Truncate()
-		}
-
-		if i > 0 && i%100000 == 0 {
-			fmt.Printf("  Written: %d/%d (%.1f%%)\r", i, numKeys/2, float64(i)*100/float64(numKeys/2))
-		}
-	}
-	fmt.Println()
-
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
+		ioLock.Lock()
 		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
-		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
+		ioLock.Unlock()
+		*physicalBytes += int64(seg.Length)
 	}
 
 	phase3Duration := time.Since(phase3Start)
@@ -451,7 +456,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 func runPureWrite(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter,
 	director compaction.Director, executor compaction.Executor,
-	numKeys, valueSize int, logicalBytes, physicalBytes *int64, compactionCount *int) {
+	numKeys, valueSize int, logicalBytes, physicalBytes *int64, compactionCount *int64) {
 
 	fmt.Println("=== PURE WRITE WORKLOAD ===")
 
@@ -486,13 +491,6 @@ func runPureWrite(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		meta.RegisterSegment(seg)
 	}
 
-	// Try compaction
-	time.Sleep(2 * time.Second)
-	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-	}
 }
 
 func runPureRead(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
@@ -547,7 +545,9 @@ func runPureRead(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		seg := binarySearchSegment(segs, key)
 		if seg != nil {
 			*totalSegmentScans++
+			ioLock.Lock()
 			sstReader.Get(seg, key)
+			ioLock.Unlock()
 		}
 
 		if i > 0 && i%500000 == 0 {
@@ -561,7 +561,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int64) {
 
 	fmt.Println("=== MIXED WORKLOAD (50/50) ===")
 
@@ -629,7 +629,9 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			seg := binarySearchSegment(segs, key)
 			if seg != nil {
 				*totalSegmentScans++
+				ioLock.Lock()
 				sstReader.Get(seg, key)
+				ioLock.Unlock()
 				meta.UpdateStats(seg.ID, 1, 0)
 			}
 		}
@@ -640,20 +642,13 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	}
 	fmt.Println()
 
-	// Compaction
-	time.Sleep(2 * time.Second)
-	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-	}
 }
 
 func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int64) {
 
 	fmt.Println("=== READ-HEAVY WORKLOAD (95% reads) ===")
 
@@ -704,7 +699,9 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			seg := binarySearchSegment(segs, key)
 			if seg != nil {
 				*totalSegmentScans++
+				ioLock.Lock()
 				sstReader.Get(seg, key)
+				ioLock.Unlock()
 				meta.UpdateStats(seg.ID, 1, 0)
 			}
 		} else {
@@ -732,20 +729,13 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	}
 	fmt.Println()
 
-	// Compaction
-	time.Sleep(2 * time.Second)
-	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-	}
 }
 
 func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int64) {
 
 	fmt.Println("=== WRITE-HEAVY WORKLOAD (95% writes) ===")
 
@@ -813,7 +803,9 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			seg := binarySearchSegment(segs, key)
 			if seg != nil {
 				*totalSegmentScans++
+				ioLock.Lock()
 				sstReader.Get(seg, key)
+				ioLock.Unlock()
 			}
 		}
 
@@ -823,20 +815,13 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	}
 	fmt.Println()
 
-	// Compaction
-	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-	}
 }
 
 func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int64) {
 
 	fmt.Println("=== ZIPFIAN WORKLOAD (hot keys, s=1.5) ===")
 
@@ -889,7 +874,9 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		seg := binarySearchSegment(segs, key)
 		if seg != nil {
 			*totalSegmentScans++
+			ioLock.Lock()
 			sstReader.Get(seg, key)
+			ioLock.Unlock()
 			meta.UpdateStats(seg.ID, 1, 0)
 		}
 
@@ -907,12 +894,4 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	fmt.Printf("  Hot key distribution: Top 10%% of keys = %d%% of accesses\n",
 		top10Percent*100/numReads)
 
-	// Compaction
-	time.Sleep(2 * time.Second)
-	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
-		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-	}
 }
