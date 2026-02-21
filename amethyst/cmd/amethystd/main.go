@@ -72,12 +72,11 @@ func zipfian(n int, s float64) int {
 	return n - 1
 }
 
-func binarySearchSegment(segs []*common.SegmentMeta, key string, totalSegmentScans *int64) *common.SegmentMeta {
+func binarySearchSegment(segs []*common.SegmentMeta, key string) *common.SegmentMeta {
 	left, right := 0, len(segs)-1
 	for left <= right {
 		mid := (left + right) / 2
 		seg := segs[mid]
-		*totalSegmentScans++
 
 		if key >= seg.MinKey && key <= seg.MaxKey {
 			return seg
@@ -91,6 +90,7 @@ func binarySearchSegment(segs []*common.SegmentMeta, key string, totalSegmentSca
 }
 
 func main() {
+	fmt.Println("yo from amethystd!") //to see if it was running the right one lol, i hope i remembered to remove,else remove
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 
@@ -301,7 +301,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
@@ -316,7 +316,8 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
+
 		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
@@ -334,7 +335,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	fmt.Printf("  Duration: %v\n", phase1Duration)
 
 	// This ensures all segments are merged into a disjoint state
-	// fmt.Println("\n=== PRE-READ CLEANUP (Establishing Leveled Invariant) ===")
+	// === PRE-READ CLEANUP (Establishing Leveled Invariant) ===
 	// for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
 	// 	fmt.Printf("  Compacting %d segments to ensure disjoint ranges...\n", len(plan.Inputs))
 	// 	newSeg, _ := executor.Execute(plan)
@@ -354,8 +355,9 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		segs := meta.GetAllSegments() // Returns sorted list
 
 		*totalReads++
-		seg := binarySearchSegment(segs, key, totalSegmentScans)
+		seg := binarySearchSegment(segs, key)
 		if seg != nil {
+			*totalSegmentScans++ // <--- THIS is an actual file/SSTable probe!
 			sstReader.Get(seg, key)
 			meta.UpdateStats(seg.ID, 1, 0)
 		}
@@ -379,14 +381,13 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	fmt.Printf("  Current RA: %.2f\n", phase2RA)
 	fmt.Printf("  Duration: %v\n", phase2Duration)
 
-	// Try compaction
+	// Post-Read Compaction Trigger
 	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
+	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
 		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
 		newSeg, _ := executor.Execute(plan)
 		*physicalBytes += newSeg.Length
 		*compactionCount++
-		fmt.Printf("  New strategy: %v\n", newSeg.Strategy)
 	}
 
 	// PHASE 3: Write again
@@ -404,7 +405,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
@@ -419,7 +420,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
@@ -435,14 +436,13 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 	fmt.Printf("  Duration: %v\n", phase3Duration)
 
-	// Try compaction again
+	// Final Compaction Trigger
 	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
+	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
 		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
 		newSeg, _ := executor.Execute(plan)
 		*physicalBytes += newSeg.Length
 		*compactionCount++
-		fmt.Printf("  New strategy: %v\n", newSeg.Strategy)
 	}
 
 	return phases
@@ -466,7 +466,7 @@ func runPureWrite(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
@@ -481,14 +481,14 @@ func runPureWrite(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
 
 	// Try compaction
 	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
+	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
 		newSeg, _ := executor.Execute(plan)
 		*physicalBytes += newSeg.Length
 		*compactionCount++
@@ -513,7 +513,7 @@ func runPureRead(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			meta.RegisterSegment(seg)
 			w.Truncate()
 		}
@@ -527,7 +527,7 @@ func runPureRead(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 		meta.RegisterSegment(seg)
 	}
 
@@ -544,8 +544,9 @@ func runPureRead(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		segs := meta.GetAllSegments()
 
 		*totalReads++
-		seg := binarySearchSegment(segs, key, totalSegmentScans)
+		seg := binarySearchSegment(segs, key)
 		if seg != nil {
+			*totalSegmentScans++
 			sstReader.Get(seg, key)
 		}
 
@@ -577,7 +578,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
@@ -592,7 +593,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
@@ -614,7 +615,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 			if mem.ShouldFlush() {
 				data := mem.Flush()
-				seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+				seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 				*physicalBytes += seg.Length
 				meta.RegisterSegment(seg)
 				w.Truncate()
@@ -625,8 +626,9 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			segs := meta.GetAllSegments()
 
 			*totalReads++
-			seg := binarySearchSegment(segs, key, totalSegmentScans)
+			seg := binarySearchSegment(segs, key)
 			if seg != nil {
+				*totalSegmentScans++
 				sstReader.Get(seg, key)
 				meta.UpdateStats(seg.ID, 1, 0)
 			}
@@ -640,7 +642,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 	// Compaction
 	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
+	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
 		newSeg, _ := executor.Execute(plan)
 		*physicalBytes += newSeg.Length
 		*compactionCount++
@@ -668,7 +670,7 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
@@ -683,7 +685,7 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
@@ -699,8 +701,9 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			segs := meta.GetAllSegments()
 
 			*totalReads++
-			seg := binarySearchSegment(segs, key, totalSegmentScans)
+			seg := binarySearchSegment(segs, key)
 			if seg != nil {
+				*totalSegmentScans++
 				sstReader.Get(seg, key)
 				meta.UpdateStats(seg.ID, 1, 0)
 			}
@@ -716,7 +719,7 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 			if mem.ShouldFlush() {
 				data := mem.Flush()
-				seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+				seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 				*physicalBytes += seg.Length
 				meta.RegisterSegment(seg)
 				w.Truncate()
@@ -731,7 +734,7 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 	// Compaction
 	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
+	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
 		newSeg, _ := executor.Execute(plan)
 		*physicalBytes += newSeg.Length
 		*compactionCount++
@@ -759,7 +762,7 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
@@ -774,7 +777,7 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
@@ -796,7 +799,7 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 			if mem.ShouldFlush() {
 				data := mem.Flush()
-				seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+				seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 				*physicalBytes += seg.Length
 				meta.RegisterSegment(seg)
 				w.Truncate()
@@ -807,8 +810,9 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			segs := meta.GetAllSegments()
 
 			*totalReads++
-			seg := binarySearchSegment(segs, key, totalSegmentScans)
+			seg := binarySearchSegment(segs, key)
 			if seg != nil {
+				*totalSegmentScans++
 				sstReader.Get(seg, key)
 			}
 		}
@@ -849,7 +853,7 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
-			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
@@ -864,7 +868,7 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
-		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+		seg, _ := sstWriter.WriteSegment(data, common.LEVELED, 0)
 		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
@@ -882,8 +886,9 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		segs := meta.GetAllSegments()
 
 		*totalReads++
-		seg := binarySearchSegment(segs, key, totalSegmentScans)
+		seg := binarySearchSegment(segs, key)
 		if seg != nil {
+			*totalSegmentScans++
 			sstReader.Get(seg, key)
 			meta.UpdateStats(seg.ID, 1, 0)
 		}
@@ -904,7 +909,7 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 	// Compaction
 	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
+	for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
 		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
 		newSeg, _ := executor.Execute(plan)
 		*physicalBytes += newSeg.Length

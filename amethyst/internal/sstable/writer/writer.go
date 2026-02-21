@@ -14,6 +14,7 @@ type SSTableWriter interface {
 	WriteSegment(
 		sortedData []common.KVEntry,
 		strategy common.CompactionType,
+		level int,
 	) (*common.SegmentMeta, error)
 }
 
@@ -32,6 +33,7 @@ func NewWriter(fileMgr segmentfile.SegmentFileManager, indexBuilder sparseindex.
 func (w *writer) WriteSegment(
 	sortedData []common.KVEntry,
 	strategy common.CompactionType,
+	level int,
 ) (*common.SegmentMeta, error) {
 	segmentID := uuid.New().String()
 	now := time.Now().Unix()
@@ -114,6 +116,7 @@ func (w *writer) WriteSegment(
 
 	meta := &common.SegmentMeta{
 		ID:     segmentID,
+		Level:  level,
 		Offset: offset,
 		Length: length,
 

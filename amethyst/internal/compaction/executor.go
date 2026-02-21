@@ -35,7 +35,6 @@ func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
 	merged := make(map[string][]byte)
 
 	// 1. Merge all input segments (Oldest to Newest)
-	// Process in reverse so newer values override older ones
 	for i := len(plan.Inputs) - 1; i >= 0; i-- {
 		seg := plan.Inputs[i]
 		data, err := e.reader.Scan(seg)
@@ -65,12 +64,11 @@ func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
 		})
 	}
 
-	// 4. Write the sorted entries to disk
-	newSeg, err := e.writer.WriteSegment(finalEntries, plan.OutputStrategy)
+	// 4. Write the sorted entries to disk as a single file
+	newSeg, err := e.writer.WriteSegment(finalEntries, plan.OutputStrategy, plan.TargetLevel)
 	if err != nil {
 		return nil, err
 	}
-
 	e.meta.RegisterSegment(newSeg)
 
 	// Mark old segments obsolete
@@ -79,7 +77,7 @@ func (e *executor) Execute(plan *Plan) (*common.SegmentMeta, error) {
 	}
 
 	strategyName := "LEVELED"
-
 	log.Printf("COMPACT %d segments → %s strategy (%s)", len(plan.Inputs), strategyName, plan.Reason)
+
 	return newSeg, nil
 }

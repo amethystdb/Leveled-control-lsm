@@ -10,6 +10,7 @@ type Plan struct {
 	Inputs         []*common.SegmentMeta
 	OutputStrategy common.CompactionType
 	Reason         string
+	TargetLevel    int
 }
 
 type Director interface {
@@ -41,64 +42,82 @@ func NewDefaultDirector(meta metadata.Tracker) *director {
 }
 
 func (d *director) MaybePlan() *Plan {
-	segments := d.meta.GetAllSegments()
-	// DEBUG: fmt.Printf("Director seeing %d segments\n", len(segments))
-
-	if len(segments) < 2 {
-		return nil
+	// Check Level 0 first (Trigger: File count >= 4)
+	l0Segments := d.getSegmentsAtLevel(0)
+	if len(l0Segments) >= 4 {
+		return d.buildL0toL1Plan(l0Segments)
 	}
 
-	for _, seg := range segments {
-		// DEBUG: fmt.Printf("Checking Segment %s: Range [%s - %s]\n", seg.ID, seg.MinKey, seg.MaxKey)
-		overlaps := d.collectAllOverlaps(seg)
-		// DEBUG: fmt.Printf("Found %d overlaps for %s\n", len(overlaps), seg.ID)
-
-		if len(overlaps) > 1 {
-			return &Plan{
-				Inputs:         overlaps,
-				OutputStrategy: common.LEVELED,
-				Reason:         "Leveled: merging overlapping ranges",
-			}
-		}
+	// Check Level 1 (Trigger: Total size > 10MB)
+	l1Segments := d.getSegmentsAtLevel(1)
+	if d.totalSize(l1Segments) > 10*1024*1024 { // 10 MB limit
+		return d.buildLevelPlan(1, 2, l1Segments)
 	}
+
 	return nil
 }
 
-// pickCompactionTarget selects a segment to compact (usually from L0 or a small level)
-func pickCompactionTarget(segments []*common.SegmentMeta) *common.SegmentMeta {
-	for _, seg := range segments {
-		if !seg.Obsolete {
-			return seg
+// --- NEW HELPER METHODS ---
+
+func (d *director) getSegmentsAtLevel(level int) []*common.SegmentMeta {
+	var result []*common.SegmentMeta
+	for _, seg := range d.meta.GetAllSegments() {
+		if seg.Level == level && !seg.Obsolete {
+			result = append(result, seg)
 		}
 	}
-	return nil
+	return result
 }
 
-// collectAllOverlaps recursively finds all segments that overlap with the target
-// This is critical for leveled compaction: you must compact overlapping files together
-// collectAllOverlaps replacement using the new Metadata Ordered Map logic
-func (d *director) collectAllOverlaps(target *common.SegmentMeta) []*common.SegmentMeta {
-	inputs := []*common.SegmentMeta{target}
+func (d *director) totalSize(segments []*common.SegmentMeta) int64 {
+	var size int64 = 0
+	for _, seg := range segments {
+		size += seg.Length
+	}
+	return size
+}
+
+// L0 to L1 merges ALL of L0 into overlapping L1 files
+func (d *director) buildL0toL1Plan(l0Segs []*common.SegmentMeta) *Plan {
+	inputs := append([]*common.SegmentMeta{}, l0Segs...)
+
+	// Find all L1 segments that overlap with ANY L0 segment
+	l1Segs := d.getSegmentsAtLevel(1)
 	seen := make(map[string]bool)
-	seen[target.ID] = true
 
-	changed := true
-	for changed {
-		changed = false
-		// For each segment in our current merge set, find its overlaps
-		for i := 0; i < len(inputs); i++ {
-			input := inputs[i]
-			// This call uses the internal ordered slice we built in metadata.go
-			overlaps := d.meta.GetOverlappingSegments(input)
-			for _, overlap := range overlaps {
-				if !seen[overlap.ID] {
-					inputs = append(inputs, overlap)
-					seen[overlap.ID] = true
-					changed = true
-				}
+	for _, l0 := range l0Segs {
+		for _, l1 := range l1Segs {
+			if !seen[l1.ID] && !(l1.MaxKey < l0.MinKey || l1.MinKey > l0.MaxKey) {
+				inputs = append(inputs, l1)
+				seen[l1.ID] = true
 			}
 		}
 	}
 
-	return inputs
+	return &Plan{
+		Inputs:         inputs,
+		OutputStrategy: common.LEVELED,
+		Reason:         "Leveled: L0 hit capacity (4 files), merging to L1",
+		TargetLevel:    1,
+	}
+}
+
+// L1+ merges pick ONE file and merge it into overlapping files in the next level
+func (d *director) buildLevelPlan(currentLevel int, targetLevel int, currentSegs []*common.SegmentMeta) *Plan {
+	target := currentSegs[0] // Pick the oldest
+	inputs := []*common.SegmentMeta{target}
+
+	nextLevelSegs := d.getSegmentsAtLevel(targetLevel)
+	for _, next := range nextLevelSegs {
+		if !(next.MaxKey < target.MinKey || next.MinKey > target.MaxKey) {
+			inputs = append(inputs, next)
+		}
+	}
+
+	return &Plan{
+		Inputs:         inputs,
+		OutputStrategy: common.LEVELED,
+		Reason:         "Leveled: Capacity exceeded, cascading down",
+		TargetLevel:    targetLevel,
+	}
 }

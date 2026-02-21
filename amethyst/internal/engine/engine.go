@@ -54,7 +54,7 @@ func (e *Engine) ExecuteFlush() error {
 	}
 
 	// Assign to 'seg' and actually use it (or use _ if you really don't need it)
-	seg, err := e.writer.WriteSegment(data, common.LEVELED)
+	seg, err := e.writer.WriteSegment(data, common.LEVELED, 0)
 	if err != nil {
 		return fmt.Errorf("SSTable write failure: %w", err)
 	}
