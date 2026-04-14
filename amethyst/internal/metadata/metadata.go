@@ -17,9 +17,11 @@ type Tracker interface {
 }
 
 type tracker struct {
-	mu       sync.RWMutex
-	segments map[string]*common.SegmentMeta
-	ordered  []*common.SegmentMeta
+	mu           sync.RWMutex
+	segments     map[string]*common.SegmentMeta
+	ordered      []*common.SegmentMeta
+	sortedCache  []*common.SegmentMeta  // Cached sorted, non-obsolete segments
+	cacheValid   bool                   // Whether sortedCache is up-to-date
 }
 
 // NewTracker creates a new MetadataTracker.
@@ -36,6 +38,7 @@ func (t *tracker) RegisterSegment(meta *common.SegmentMeta) {
 
 	t.segments[meta.ID] = meta
 	t.ordered = append([]*common.SegmentMeta{meta}, t.ordered...)
+	t.cacheValid = false  // Invalidate cache on segment registration
 }
 
 func (t *tracker) GetSegmentsForKey(key string) []*common.SegmentMeta {
@@ -56,8 +59,26 @@ func (t *tracker) GetSegmentsForKey(key string) []*common.SegmentMeta {
 }
 
 func (t *tracker) GetAllSegments() []*common.SegmentMeta {
+	// Fast path: cache hit under read lock
 	t.mu.RLock()
-	defer t.mu.RUnlock()
+	if t.cacheValid {
+		result := make([]*common.SegmentMeta, len(t.sortedCache))
+		copy(result, t.sortedCache)
+		t.mu.RUnlock()
+		return result
+	}
+	t.mu.RUnlock()
+
+	// Slow path: rebuild under write lock
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Re-check after acquiring write lock (another goroutine may have rebuilt)
+	if t.cacheValid {
+		result := make([]*common.SegmentMeta, len(t.sortedCache))
+		copy(result, t.sortedCache)
+		return result
+	}
 
 	result := make([]*common.SegmentMeta, 0, len(t.ordered))
 	for _, seg := range t.ordered {
@@ -65,13 +86,15 @@ func (t *tracker) GetAllSegments() []*common.SegmentMeta {
 			result = append(result, seg)
 		}
 	}
-
-	// LEVELED REQUIREMENT: Sort by MinKey so Binary Search in main.go works
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].MinKey < result[j].MinKey
 	})
+	t.sortedCache = result
+	t.cacheValid = true
 
-	return result
+	out := make([]*common.SegmentMeta, len(result))
+	copy(out, result)
+	return out
 }
 
 // GetOverlappingSegments returns all non-obsolete segments that overlap with the target segment
@@ -102,6 +125,7 @@ func (t *tracker) MarkObsolete(id string) {
 
 	if seg, ok := t.segments[id]; ok {
 		seg.Obsolete = true
+		t.cacheValid = false  // Invalidate cache when segment becomes obsolete
 	}
 }
 

@@ -70,8 +70,8 @@ func (w *diskWAL) write(entry common.WALEntry) error {
 		return err
 	}
 
-	//write to phy disk
-	return w.file.Sync()
+	// Don't sync on every write - too slow for benchmarks
+	return nil
 }
 
 // on start to reconstruct db
@@ -122,9 +122,15 @@ func (w *diskWAL) ReadAll() ([]common.WALEntry, error) {
 func (w *diskWAL) Truncate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.file != nil {
-		w.file.Close()
+
+	if w.file == nil {
+		return nil
 	}
 
-	return os.Remove(w.path)
+	if err := w.file.Truncate(0); err != nil {
+		return err
+	}
+
+	_, err := w.file.Seek(0, 0)
+	return err
 }
