@@ -138,6 +138,7 @@ func main() {
 	director := compaction.NewDefaultDirector(meta)
 	executor := compaction.NewExecutor(meta, sstReader, sstWriter)
 
+
 	// Metrics tracking
 	var logicalBytes int64 = 0
 	var physicalBytes int64 = 0
@@ -145,6 +146,39 @@ func main() {
 	var totalSegmentScans int64 = 0
 	compactionCount := 0
 	var phases []PhaseResult
+
+  stopCompaction := make(chan struct{})
+
+  go func() {
+      ticker := time.NewTicker(3 * time.Second)
+      defer ticker.Stop()
+      for {
+          select {
+          case <-ticker.C:
+              fmt.Printf("  [DEBUG] Checking for compaction...\n")
+              plan := director.MaybePlan()
+              if plan != nil {
+                  fmt.Printf("  [BG Compaction] Triggered: %s\n", plan.Reason)
+                  // Guard: skip if any input segment is nil or obsolete
+                  validInputs := true
+                  for _, seg := range plan.Inputs {
+                      if seg == nil || seg.Obsolete {
+                          validInputs = false
+                          break
+                      }
+                  }
+                  if validInputs {
+                      _, _ = executor.Execute(plan)
+                      compactionCount++
+                  }
+              } else {
+                fmt.Printf("  [DEBUG] No compaction needed\n")
+              }
+          case <-stopCompaction:
+              return
+          }
+      }
+  }()
 
 	startTime := time.Now()
 
@@ -189,17 +223,22 @@ func main() {
 		os.Exit(1)
 	}
 
+  close(stopCompaction)
+  time.Sleep(5 * time.Second)
+  fmt.Println("Background compaction stopped")
+
 	totalDuration := time.Since(startTime)
 
 	// Calculate final metrics
-	wa := 0.0
-	if logicalBytes > 0 {
-		wa = float64(physicalBytes) / float64(logicalBytes)
-	}
-	ra := 0.0
-	if totalReads > 0 {
-		ra = float64(totalSegmentScans) / float64(totalReads)
-	}
+  wa := 0.0
+  if logicalBytes > 0 {
+      wa = float64(common.PhysicalWriteBytes) / float64(logicalBytes)
+  }
+
+  ra := 0.0
+  if totalReads > 0 {
+      ra = float64(common.SegmentReadCount) / float64(totalReads)
+  }
 
 	// Space amplification (approximate)
 	allSegs := meta.GetAllSegments()
@@ -237,9 +276,9 @@ func main() {
 		CompactionCount:    compactionCount,
 		TotalDurationSec:   totalDuration.Seconds(),
 		LogicalBytes:       logicalBytes,
-		PhysicalBytes:      physicalBytes,
+    PhysicalBytes:      common.PhysicalWriteBytes,
 		TotalReads:         totalReads,
-		SegmentScans:       totalSegmentScans,
+    SegmentScans:       common.SegmentReadCount,
 		LiveDataBytes:      liveDataBytes,
 		TotalDiskBytes:     totalDiskBytes,
 		Phases:             phases,
@@ -281,15 +320,18 @@ func main() {
 func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
-	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
+	numKeys, valueSize int, logicalBytes, _ *int64, totalReads, _ *int64,
 	compactionCount *int) []PhaseResult {
 
 	var phases []PhaseResult
 
-	// PHASE 1: Write
+	// ======================
+	// PHASE 1: WRITE
+	// ======================
 	fmt.Println("=== PHASE 1: Write ===")
 	phase1Start := time.Now()
 
+	// Round 1: Sequential write to populate all keys
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("key-%010d", i)
 		val := make([]byte, valueSize)
@@ -302,7 +344,6 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		if mem.ShouldFlush() {
 			data := mem.Flush()
 			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
-			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
 		}
@@ -311,18 +352,37 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			fmt.Printf("  Written: %d/%d (%.1f%%)\r", i, numKeys, float64(i)*100/float64(numKeys))
 		}
 	}
+
+	// Round 2: Random overwrites to create overlapping segments
+	overwriteCount := numKeys / 2
+	for i := 0; i < overwriteCount; i++ {
+		key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+		val := make([]byte, valueSize)
+		rand.Read(val)
+
+		w.LogPut(key, val)
+		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
+
+		if mem.ShouldFlush() {
+			data := mem.Flush()
+			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
+			meta.RegisterSegment(seg)
+			w.Truncate()
+		}
+	}
 	fmt.Println()
 
 	// Final flush
 	if mem.ShouldFlush() {
 		data := mem.Flush()
 		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
-		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
 
 	phase1Duration := time.Since(phase1Start)
-	phase1WA := float64(*physicalBytes) / float64(*logicalBytes)
+	phase1WA := float64(common.PhysicalWriteBytes) / float64(*logicalBytes)
+
 	phases = append(phases, PhaseResult{
 		Name:     "write",
 		Duration: phase1Duration.Seconds(),
@@ -333,31 +393,32 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	fmt.Printf("  Segments: %d\n", len(meta.GetAllSegments()))
 	fmt.Printf("  Duration: %v\n", phase1Duration)
 
-	// This ensures all segments are merged into a disjoint state
-	// fmt.Println("\n=== PRE-READ CLEANUP (Establishing Leveled Invariant) ===")
-	// for plan := director.MaybePlan(); plan != nil; plan = director.MaybePlan() {
-	// 	fmt.Printf("  Compacting %d segments to ensure disjoint ranges...\n", len(plan.Inputs))
-	// 	newSeg, _ := executor.Execute(plan)
-	// 	*physicalBytes += newSeg.Length
-	// 	*compactionCount++
-	// }
-
-	// PHASE 2: Read
+	// ======================
+	// PHASE 2: READ
+	// ======================
 	fmt.Println("\n=== PHASE 2: Read (3x) ===")
 	time.Sleep(2 * time.Second)
 
 	phase2Start := time.Now()
 	numReads := numKeys * 3
+	var phase2SegmentScans int64 = 0
+	var phase2Reads int64 = 0
 
 	for i := 0; i < numReads; i++ {
 		key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
-		segs := meta.GetAllSegments() // Returns sorted list
 
 		*totalReads++
-		seg := binarySearchSegment(segs, key, totalSegmentScans)
-		if seg != nil {
-			sstReader.Get(seg, key)
+		phase2Reads++
+
+		segs := meta.GetSegmentsForKey(key)
+		phase2SegmentScans += int64(len(segs))
+
+		for _, seg := range segs {
+			_, ok := sstReader.Get(seg, key)
 			meta.UpdateStats(seg.ID, 1, 0)
+			if ok {
+				break
+			}
 		}
 
 		if i > 0 && i%500000 == 0 {
@@ -367,8 +428,9 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	fmt.Println()
 
 	phase2Duration := time.Since(phase2Start)
-	phase2RA := float64(*totalSegmentScans) / float64(*totalReads)
-	phase2WA := float64(*physicalBytes) / float64(*logicalBytes)
+	phase2RA := float64(phase2SegmentScans) / float64(phase2Reads)
+	phase2WA := float64(common.PhysicalWriteBytes) / float64(*logicalBytes)
+
 	phases = append(phases, PhaseResult{
 		Name:     "read",
 		Duration: phase2Duration.Seconds(),
@@ -379,17 +441,12 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	fmt.Printf("  Current RA: %.2f\n", phase2RA)
 	fmt.Printf("  Duration: %v\n", phase2Duration)
 
-	// Try compaction
-	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
-		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-		fmt.Printf("  New strategy: %v\n", newSeg.Strategy)
-	}
+	// Let background compaction work
+	time.Sleep(10 * time.Second)
 
-	// PHASE 3: Write again
+	// ======================
+	// PHASE 3: WRITE AGAIN (50%)
+	// ======================
 	fmt.Println("\n=== PHASE 3: Write (50%) ===")
 	phase3Start := time.Now()
 
@@ -405,7 +462,6 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		if mem.ShouldFlush() {
 			data := mem.Flush()
 			seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
-			*physicalBytes += seg.Length
 			meta.RegisterSegment(seg)
 			w.Truncate()
 		}
@@ -420,12 +476,12 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	if mem.ShouldFlush() {
 		data := mem.Flush()
 		seg, _ := sstWriter.WriteSegment(data, common.LEVELED)
-		*physicalBytes += seg.Length
 		meta.RegisterSegment(seg)
 	}
 
 	phase3Duration := time.Since(phase3Start)
-	phase3WA := float64(*physicalBytes) / float64(*logicalBytes)
+	phase3WA := float64(common.PhysicalWriteBytes) / float64(*logicalBytes)
+
 	phases = append(phases, PhaseResult{
 		Name:     "write2",
 		Duration: phase3Duration.Seconds(),
@@ -433,17 +489,61 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		RA:       phase2RA,
 	})
 
+	fmt.Printf("  Segments: %d\n", len(meta.GetAllSegments()))
 	fmt.Printf("  Duration: %v\n", phase3Duration)
 
-	// Try compaction again
-	time.Sleep(2 * time.Second)
-	if plan := director.MaybePlan(); plan != nil {
-		fmt.Printf("  Compaction triggered: %s\n", plan.Reason)
-		newSeg, _ := executor.Execute(plan)
-		*physicalBytes += newSeg.Length
-		*compactionCount++
-		fmt.Printf("  New strategy: %v\n", newSeg.Strategy)
+	// Let background compaction work on new overlapping segments
+	time.Sleep(10 * time.Second)
+
+	// ======================
+	// PHASE 4: READ AFTER OVERWRITES
+	// ======================
+	fmt.Println("\n=== PHASE 4: Read After Overwrites ===")
+	phase4Start := time.Now()
+	numReads4 := numKeys * 3
+	var phase4SegmentScans int64 = 0
+	var phase4Reads int64 = 0
+
+	for i := 0; i < numReads4; i++ {
+		key := fmt.Sprintf("key-%010d", rand.Intn(numKeys))
+
+		*totalReads++
+		phase4Reads++
+
+		segs := meta.GetSegmentsForKey(key)
+		phase4SegmentScans += int64(len(segs))
+
+		for _, seg := range segs {
+			_, ok := sstReader.Get(seg, key)
+			meta.UpdateStats(seg.ID, 1, 0)
+			if ok {
+				break
+			}
+		}
+
+		if i > 0 && i%500000 == 0 {
+			currentRA := float64(phase4SegmentScans) / float64(phase4Reads)
+			fmt.Printf("  Reads: %d/%d (%.1f%%) RA=%.2f\r", i, numReads4, float64(i)*100/float64(numReads4), currentRA)
+		}
 	}
+	fmt.Println()
+
+	phase4Duration := time.Since(phase4Start)
+	phase4RA := float64(phase4SegmentScans) / float64(phase4Reads)
+	phase4WA := float64(common.PhysicalWriteBytes) / float64(*logicalBytes)
+
+	fmt.Printf("  Current RA: %.2f (with overlapping segments)\n", phase4RA)
+	fmt.Printf("  Duration: %v\n", phase4Duration)
+
+	phases = append(phases, PhaseResult{
+		Name:     "read_after_overwrites",
+		Duration: phase4Duration.Seconds(),
+		WA:       phase4WA,
+		RA:       phase4RA,
+	})
+
+	// Let background compaction catch up
+	time.Sleep(10 * time.Second)
 
 	return phases
 }

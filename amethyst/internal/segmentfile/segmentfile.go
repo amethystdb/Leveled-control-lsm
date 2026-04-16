@@ -4,6 +4,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+  "amethyst/internal/common"
 )
 
 type SegmentFileManager interface {
@@ -38,14 +39,12 @@ func (s *localFileManager) Append(data []byte) (int64, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Close mmap before writing to invalidate cache
 	if s.isMMapped && s.mmapData != nil {
 		syscall.Munmap(s.mmapData)
 		s.isMMapped = false
 		s.mmapData = nil
 	}
 
-	//current size to know the start offset
 	stat, err := s.file.Stat()
 	if err != nil {
 		return 0, 0, err
@@ -53,11 +52,12 @@ func (s *localFileManager) Append(data []byte) (int64, int64, error) {
 	offset := stat.Size()
 	length := int64(len(data))
 
-	//write the data to the end
 	_, err = s.file.Write(data)
 	if err != nil {
 		return 0, 0, err
 	}
+
+	common.AddWriteBytes(length)
 
 	return offset, length, nil
 }
@@ -69,6 +69,9 @@ func (s *localFileManager) ReadAt(offset int64, length int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	common.AddReadBytes(length)
+
 	return buf, nil
 }
 

@@ -22,6 +22,8 @@ func NewReader(fileMgr segmentfile.SegmentFileManager) *Reader {
 }
 
 func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
+  common.IncSegmentRead()
+
 	// Fast reject by key range
 	if target < meta.MinKey || target > meta.MaxKey {
 		return nil, false
@@ -97,24 +99,24 @@ func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
 }
 
 func (r *Reader) Scan(meta *common.SegmentMeta) (map[string][]byte, error) {
-	result := make(map[string][]byte)
+  common.IncSegmentRead()
 
-	// Get mmapped data
-	mmapData, err := r.fileMgr.GetMmapData()
-	if err != nil {
-		return nil, err
-	}
+  result := make(map[string][]byte)
 
-	start := meta.Offset + meta.DataStartOffset
-	end := meta.Offset + meta.SparseIndexOffset
+  start := meta.Offset + meta.DataStartOffset
+  end := meta.Offset + meta.SparseIndexOffset
+  length := end - start
 
-	// Check bounds
-	if start < 0 || end > int64(len(mmapData)) || start > end {
-		return nil, nil
-	}
+  if length <= 0 {
+      return result, nil
+  }
 
-	// Use direct slice from mmap - zero copy!
-	data := mmapData[start:end]
+  // Use ReadAt instead of mmap - safe for concurrent access
+  data, err := r.fileMgr.ReadAt(start, length)
+  if err != nil {
+      return nil, err
+  }
+
 	buf := bytes.NewReader(data)
 
 	for buf.Len() > 0 {

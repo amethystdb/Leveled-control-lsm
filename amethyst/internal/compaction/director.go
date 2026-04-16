@@ -50,16 +50,21 @@ func (d *director) MaybePlan() *Plan {
 
 	for _, seg := range segments {
 		// DEBUG: fmt.Printf("Checking Segment %s: Range [%s - %s]\n", seg.ID, seg.MinKey, seg.MaxKey)
-		overlaps := d.collectAllOverlaps(seg)
-		// DEBUG: fmt.Printf("Found %d overlaps for %s\n", len(overlaps), seg.ID)
+		const MAX_COMPACT_SEGMENTS = 20
 
-		if len(overlaps) > 1 {
-			return &Plan{
-				Inputs:         overlaps,
-				OutputStrategy: common.LEVELED,
-				Reason:         "Leveled: merging overlapping ranges",
-			}
-		}
+    overlaps := d.collectAllOverlaps(seg)
+
+    if len(overlaps) > 1 {
+      if len(overlaps) > MAX_COMPACT_SEGMENTS {
+        overlaps = overlaps[:MAX_COMPACT_SEGMENTS]
+      }
+
+      return &Plan{
+        Inputs:         overlaps,
+        OutputStrategy: common.LEVELED,
+        Reason:         "Leveled: merging overlapping ranges",
+      }
+    }
 	}
 	return nil
 }

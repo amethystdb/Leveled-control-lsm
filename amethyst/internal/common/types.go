@@ -1,10 +1,10 @@
 package common
+import "sync/atomic"
 
 type CompactionType int
 
 const (
-	// Keep these identical across all repos for standard results
-	LEVELED CompactionType = iota // 1
+	LEVELED CompactionType = iota
 )
 
 type SegmentMeta struct {
@@ -30,12 +30,10 @@ type SegmentMeta struct {
 	SparseIndexOffset int64
 }
 
-// Size returns the on-disk size of the segment in bytes for compaction decision
 func (s *SegmentMeta) Size() int64 {
 	return s.Length
 }
 
-// ReadWriteRatio returns reads / writes, guarding against divide-by-zero.
 func (s *SegmentMeta) ReadWriteRatio() float64 {
 	if s.WriteCount == 0 {
 		return float64(s.ReadCount)
@@ -43,7 +41,6 @@ func (s *SegmentMeta) ReadWriteRatio() float64 {
 	return float64(s.ReadCount) / float64(s.WriteCount)
 }
 
-// CooldownExpired returns true if enough time has passed since last rewrite.
 func (s *SegmentMeta) CooldownExpired(now int64, minInterval int64) bool {
 	return now-s.LastRewriteAt >= minInterval
 }
@@ -54,9 +51,29 @@ type WALEntry struct {
 	Tombstone bool
 }
 
-// our odered key equivalentt
 type KVEntry struct {
 	Key       string
 	Value     []byte
 	Tombstone bool
 }
+
+//
+// 🔴 GLOBAL METRICS (aligned with adaptive)
+//
+
+var PhysicalWriteBytes int64
+var PhysicalReadBytes int64
+var SegmentReadCount int64
+
+func AddWriteBytes(n int64) {
+	atomic.AddInt64(&PhysicalWriteBytes, n)
+}
+
+func AddReadBytes(n int64) {
+	atomic.AddInt64(&PhysicalReadBytes, n)
+}
+
+func IncSegmentRead() {
+	atomic.AddInt64(&SegmentReadCount, 1)
+}
+
