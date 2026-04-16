@@ -5,10 +5,14 @@ import (
 	"amethyst/internal/segmentfile"
 	"amethyst/internal/sparseindex"
 	"encoding/binary"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+var GlobalPhysicalWriteBytes int64 = 0
+var GlobalCompactionWriteBytes int64 = 0
 
 type SSTableWriter interface {
 	WriteSegment(
@@ -111,6 +115,11 @@ func (w *writer) WriteSegment(
 	if err != nil {
 		return nil, err
 	}
+
+	// Track write metrics
+	atomic.AddInt64(&GlobalPhysicalWriteBytes, length)
+	// All writes are compaction writes in this implementation (no TIERED constant)
+	atomic.AddInt64(&GlobalCompactionWriteBytes, length)
 
 	meta := &common.SegmentMeta{
 		ID:     segmentID,

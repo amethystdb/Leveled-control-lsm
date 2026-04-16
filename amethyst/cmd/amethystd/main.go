@@ -16,6 +16,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,22 +29,27 @@ var (
 
 // Results structure for JSON output
 type Results struct {
-	Engine             string        `json:"engine"`
-	Workload           string        `json:"workload"`
-	NumKeys            int           `json:"num_keys"`
-	ValueSize          int           `json:"value_size"`
-	WriteAmplification float64       `json:"write_amplification"`
-	ReadAmplification  float64       `json:"read_amplification"`
-	SpaceAmplification float64       `json:"space_amplification"`
-	CompactionCount    int           `json:"compaction_count"`
-	TotalDurationSec   float64       `json:"total_duration_sec"`
-	LogicalBytes       int64         `json:"logical_bytes"`
-	PhysicalBytes      int64         `json:"physical_bytes"`
-	TotalReads         int64         `json:"total_reads"`
-	SegmentScans       int64         `json:"segment_scans"`
-	LiveDataBytes      int64         `json:"live_data_bytes"`
-	TotalDiskBytes     int64         `json:"total_disk_bytes"`
-	Phases             []PhaseResult `json:"phases,omitempty"`
+	Engine                string        `json:"engine"`
+	Workload              string        `json:"workload"`
+	NumKeys               int           `json:"num_keys"`
+	ValueSize             int           `json:"value_size"`
+	WriteAmplification    float64       `json:"write_amplification"`
+	ReadAmplification     float64       `json:"read_amplification"`
+	SpaceAmplification    float64       `json:"space_amplification"`
+	CompactionCount       int           `json:"compaction_count"`
+	TotalDurationSec      float64       `json:"total_duration_sec"`
+	LogicalBytes          int64         `json:"logical_bytes"`
+	PhysicalBytes         int64         `json:"physical_bytes"`
+	TotalReads            int64         `json:"total_reads"`
+	SegmentScans          int64         `json:"segment_scans"`
+	LiveDataBytes         int64         `json:"live_data_bytes"`
+	TotalDiskBytes        int64         `json:"total_disk_bytes"`
+	Phases                []PhaseResult `json:"phases,omitempty"`
+	TotalComparisons      int64         `json:"total_comparisons"`
+	AvgComparisonsPerRead float64       `json:"avg_comparisons_per_read"`
+	LogicalWriteBytes     int64         `json:"logical_write_bytes"`    // User Puts
+	PhysicalWriteBytes    int64         `json:"physical_write_bytes"`   // SSTable Appends
+	CompactionWriteBytes  int64         `json:"compaction_write_bytes"` // Background churn
 }
 
 type PhaseResult struct {
@@ -143,6 +149,7 @@ func main() {
 	var physicalBytes int64 = 0
 	var totalReads int64 = 0
 	var totalSegmentScans int64 = 0
+	var logicalWriteBytes int64 = 0
 	compactionCount := 0
 	var phases []PhaseResult
 
@@ -153,11 +160,11 @@ func main() {
 	case "shift":
 		phases = runShift(w, mem, meta, sstWriter, sstReader, director, executor,
 			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
-			&totalReads, &totalSegmentScans, &compactionCount)
+			&totalReads, &totalSegmentScans, &compactionCount, &logicalWriteBytes)
 
 	case "pure-write":
 		runPureWrite(w, mem, meta, sstWriter, director, executor,
-			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes, &compactionCount)
+			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes, &compactionCount, &logicalWriteBytes)
 
 	case "pure-read":
 		runPureRead(w, mem, meta, sstWriter, sstReader,
@@ -167,22 +174,22 @@ func main() {
 	case "mixed":
 		runMixed(w, mem, meta, sstWriter, sstReader, director, executor,
 			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
-			&totalReads, &totalSegmentScans, &compactionCount)
+			&totalReads, &totalSegmentScans, &compactionCount, &logicalWriteBytes)
 
 	case "read-heavy":
 		runReadHeavy(w, mem, meta, sstWriter, sstReader, director, executor,
 			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
-			&totalReads, &totalSegmentScans, &compactionCount)
+			&totalReads, &totalSegmentScans, &compactionCount, &logicalWriteBytes)
 
 	case "write-heavy":
 		runWriteHeavy(w, mem, meta, sstWriter, sstReader, director, executor,
 			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
-			&totalReads, &totalSegmentScans, &compactionCount)
+			&totalReads, &totalSegmentScans, &compactionCount, &logicalWriteBytes)
 
 	case "zipfian":
 		runZipfian(w, mem, meta, sstWriter, sstReader, director, executor,
 			*numKeysFlag, *valueSizeFlag, &logicalBytes, &physicalBytes,
-			&totalReads, &totalSegmentScans, &compactionCount)
+			&totalReads, &totalSegmentScans, &compactionCount, &logicalWriteBytes)
 
 	default:
 		fmt.Printf("Unknown workload: %s\n", *workloadFlag)
@@ -225,24 +232,37 @@ func main() {
 		sa = 0.0
 	}
 
+	// I/O & CPU Aggregation
+	aggregatedComparisons := atomic.LoadInt64(&reader.GlobalReadComparisons)
+
+	avgCmps := 0.0
+	if totalReads > 0 {
+		avgCmps = float64(aggregatedComparisons) / float64(totalReads)
+	}
+
 	// Create results
 	results := Results{
-		Engine:             *engineFlag,
-		Workload:           *workloadFlag,
-		NumKeys:            *numKeysFlag,
-		ValueSize:          *valueSizeFlag,
-		WriteAmplification: wa,
-		ReadAmplification:  ra,
-		SpaceAmplification: sa,
-		CompactionCount:    compactionCount,
-		TotalDurationSec:   totalDuration.Seconds(),
-		LogicalBytes:       logicalBytes,
-		PhysicalBytes:      physicalBytes,
-		TotalReads:         totalReads,
-		SegmentScans:       totalSegmentScans,
-		LiveDataBytes:      liveDataBytes,
-		TotalDiskBytes:     totalDiskBytes,
-		Phases:             phases,
+		Engine:                *engineFlag,
+		Workload:              *workloadFlag,
+		NumKeys:               *numKeysFlag,
+		ValueSize:            *valueSizeFlag,
+		WriteAmplification:    wa,
+		ReadAmplification:     ra,
+		SpaceAmplification:    sa,
+		CompactionCount:       compactionCount,
+		TotalDurationSec:      totalDuration.Seconds(),
+		LogicalBytes:          logicalBytes,
+		PhysicalBytes:         physicalBytes,
+		TotalReads:            totalReads,
+		SegmentScans:          totalSegmentScans,
+		LiveDataBytes:         liveDataBytes,
+		TotalDiskBytes:        totalDiskBytes,
+		Phases:                phases,
+		TotalComparisons:      aggregatedComparisons,
+		AvgComparisonsPerRead: avgCmps,
+		LogicalWriteBytes:     logicalWriteBytes,
+		PhysicalWriteBytes:    atomic.LoadInt64(&writer.GlobalPhysicalWriteBytes),
+		CompactionWriteBytes:  atomic.LoadInt64(&writer.GlobalCompactionWriteBytes),
 	}
 
 	// Print summary
@@ -253,10 +273,16 @@ func main() {
 	fmt.Printf("Write Amplification:  %.2f\n", wa)
 	fmt.Printf("Read Amplification:   %.2f\n", ra)
 	fmt.Printf("Space Amplification:  %.2f\n", sa)
+	fmt.Printf("------------------------------------------\n")
+	fmt.Printf("Logical Writes:       %.2f MB\n", float64(logicalWriteBytes)/(1024*1024))
+	fmt.Printf("Physical Flush I/O:   %.2f MB\n", float64(atomic.LoadInt64(&writer.GlobalPhysicalWriteBytes))/(1024*1024))
+	fmt.Printf("Compaction I/O:       %.2f MB\n", float64(atomic.LoadInt64(&writer.GlobalCompactionWriteBytes))/(1024*1024))
+	fmt.Printf("------------------------------------------\n")
+	fmt.Printf("Total Comparisons:    %d\n", aggregatedComparisons)
+	fmt.Printf("Avg Comparisons/Read: %.2f\n", avgCmps)
 	fmt.Printf("Compaction Count:     %d\n", compactionCount)
 	fmt.Printf("Total Duration:       %.2fs\n", totalDuration.Seconds())
-	fmt.Printf("Throughput:           %.0f ops/sec\n",
-		float64(*numKeysFlag)/totalDuration.Seconds())
+	fmt.Printf("Throughput:           %.0f ops/sec\n", float64(*numKeysFlag)/totalDuration.Seconds())
 	fmt.Println()
 
 	// Save to JSON
@@ -282,7 +308,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) []PhaseResult {
+	compactionCount *int, logicalWriteBytes *int64) []PhaseResult {
 
 	var phases []PhaseResult
 
@@ -298,6 +324,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		w.LogPut(key, val)
 		mem.Put(key, val)
 		*logicalBytes += int64(len(key) + valueSize)
+		*logicalWriteBytes += int64(len(key) + len(val))
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
@@ -463,7 +490,7 @@ func runShift(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 func runPureWrite(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter,
 	director compaction.Director, executor compaction.Executor,
-	numKeys, valueSize int, logicalBytes, physicalBytes *int64, compactionCount *int) {
+	numKeys, valueSize int, logicalBytes, physicalBytes *int64, compactionCount *int, logicalWriteBytes *int64) {
 
 	fmt.Println("=== PURE WRITE WORKLOAD ===")
 
@@ -475,6 +502,7 @@ func runPureWrite(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		w.LogPut(key, val)
 		mem.Put(key, val)
 		*logicalBytes += int64(len(key) + valueSize)
+		*logicalWriteBytes += int64(len(key) + len(val))
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
@@ -525,6 +553,7 @@ func runPureRead(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 
 		w.LogPut(key, val)
 		mem.Put(key, val)
+		*logicalBytes += int64(len(key) + valueSize)
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
@@ -575,7 +604,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int, logicalWriteBytes *int64) {
 
 	fmt.Println("=== MIXED WORKLOAD (50/50) ===")
 
@@ -589,6 +618,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		w.LogPut(key, val)
 		mem.Put(key, val)
 		*logicalBytes += int64(len(key) + valueSize)
+		*logicalWriteBytes += int64(len(key) + len(val))
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
@@ -626,6 +656,7 @@ func runMixed(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			w.LogPut(key, val)
 			mem.Put(key, val)
 			*logicalBytes += int64(len(key) + valueSize)
+			*logicalWriteBytes += int64(len(key) + len(val))
 
 			if mem.ShouldFlush() {
 				data := mem.Flush()
@@ -669,7 +700,7 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int, logicalWriteBytes *int64) {
 
 	fmt.Println("=== READ-HEAVY WORKLOAD (95% reads) ===")
 
@@ -683,6 +714,7 @@ func runReadHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		w.LogPut(key, val)
 		mem.Put(key, val)
 		*logicalBytes += int64(len(key) + valueSize)
+		*logicalWriteBytes += int64(len(key) + len(val))
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
@@ -763,7 +795,7 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int, logicalWriteBytes *int64) {
 
 	fmt.Println("=== WRITE-HEAVY WORKLOAD (95% writes) ===")
 
@@ -777,6 +809,7 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		w.LogPut(key, val)
 		mem.Put(key, val)
 		*logicalBytes += int64(len(key) + valueSize)
+		*logicalWriteBytes += int64(len(key) + len(val))
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()
@@ -814,6 +847,7 @@ func runWriteHeavy(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 			w.LogPut(key, val)
 			mem.Put(key, val)
 			*logicalBytes += int64(len(key) + valueSize)
+			*logicalWriteBytes += int64(len(key) + len(val))
 
 			if mem.ShouldFlush() {
 				data := mem.Flush()
@@ -856,7 +890,7 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 	sstWriter writer.SSTableWriter, sstReader reader.SSTableReader,
 	director compaction.Director, executor compaction.Executor,
 	numKeys, valueSize int, logicalBytes, physicalBytes, totalReads, totalSegmentScans *int64,
-	compactionCount *int) {
+	compactionCount *int, logicalWriteBytes *int64) {
 
 	fmt.Println("=== ZIPFIAN WORKLOAD (hot keys, s=1.5) ===")
 
@@ -870,6 +904,7 @@ func runZipfian(w wal.WAL, mem memtable.Memtable, meta metadata.Tracker,
 		w.LogPut(key, val)
 		mem.Put(key, val)
 		*logicalBytes += int64(len(key) + valueSize)
+		*logicalWriteBytes += int64(len(key) + len(val))
 
 		if mem.ShouldFlush() {
 			data := mem.Flush()

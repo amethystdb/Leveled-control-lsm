@@ -3,35 +3,40 @@
   "workload": "shift",
   "num_keys": 1000000,
   "value_size": 256,
-  "write_amplification": 2.4162621037037035,
-  "read_amplification": 6.988604,
+  "write_amplification": 2.409024049382716,
+  "read_amplification": 6.988661,
   "space_amplification": 1.0167575833333333,
   "compaction_count": 2,
-  "total_duration_sec": 88.457591956,
+  "total_duration_sec": 82.934990147,
   "logical_bytes": 405000000,
-  "physical_bytes": 978586152,
+  "physical_bytes": 975654740,
   "total_reads": 3000000,
-  "segment_scans": 20965812,
+  "segment_scans": 20965983,
   "live_data_bytes": 276000000,
   "total_disk_bytes": 280625093,
   "phases": [
     {
       "name": "write",
-      "duration_sec": 17.567583596,
+      "duration_sec": 13.30682352,
       "wa": 1.0394362407407407,
       "ra": 0
     },
     {
       "name": "read",
-      "duration_sec": 23.48272397,
+      "duration_sec": 15.999816352,
       "wa": 1.0394362407407407,
-      "ra": 6.988604
+      "ra": 6.988661
     },
     {
       "name": "write2",
-      "duration_sec": 7.609802518,
+      "duration_sec": 6.614353256,
       "wa": 1.0394363555555555,
       "ra": 0
     }
-  ]
+  ],
+  "total_comparisons": 25503038,
+  "avg_comparisons_per_read": 8.501012666666666,
+  "logical_write_bytes": 270000000,
+  "physical_write_bytes": 975654740,
+  "compaction_write_bytes": 975654740
 }
