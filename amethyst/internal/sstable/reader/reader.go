@@ -6,7 +6,10 @@ import (
 	"amethyst/internal/sparseindex"
 	"bytes"
 	"encoding/binary"
+	"sync/atomic"
 )
+
+var GlobalReadComparisons int64 = 0
 
 type SSTableReader interface {
 	Get(meta *common.SegmentMeta, key string) ([]byte, bool)
@@ -79,6 +82,8 @@ func (r *Reader) Get(meta *common.SegmentMeta, target string) ([]byte, bool) {
 				return nil, false
 			}
 		}
+
+		atomic.AddInt64(&GlobalReadComparisons, 1)
 
 		if key == target {
 			if tomb == 1 {

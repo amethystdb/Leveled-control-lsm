@@ -59,6 +59,11 @@ func (s *localFileManager) Append(data []byte) (int64, int64, error) {
 		return 0, 0, err
 	}
 
+	// Sync SSTable writes to disk for durability
+	if err := s.file.Sync(); err != nil {
+		return 0, 0, err
+	}
+
 	return offset, length, nil
 }
 
